@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>{{ title or "Nexora" }}</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Sora:wght@300;400;600;700&display=swap');
+    :root {
+      --bg: #0b0f1a;
+      --card: #111827;
+      --card-2: #0f172a;
+      --text: #e5e7eb;
+      --muted: #94a3b8;
+      --accent: #ff7a59;
+      --accent-2: #22d3ee;
+      --border: rgba(255,255,255,0.08);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Sora", system-ui, -apple-system, sans-serif;
+      background: radial-gradient(1200px 700px at 10% -10%, #1f2937 0%, #0b0f1a 60%),
+                  radial-gradient(800px 600px at 90% 10%, #111827 0%, #0b0f1a 70%);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    .wrap {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 32px 24px 72px;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 24px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+    }
+    .brand-badge {
+      width: 36px;
+      height: 36px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      box-shadow: 0 0 30px rgba(255,122,89,0.35);
+    }
+    .pill {
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.08);
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .card {
+      background: linear-gradient(180deg, var(--card), var(--card-2));
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 20px;
+      box-shadow: 0 30px 60px rgba(0,0,0,0.35);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 10px 16px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,0.1);
+      background: #0b1220;
+      color: var(--text);
+      text-decoration: none;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .btn.primary {
+      background: linear-gradient(135deg, var(--accent), #ff9f80);
+      color: #0b0f1a;
+      border: none;
+    }
+    .btn.ghost {
+      background: transparent;
+    }
+    .input {
+      width: 100%;
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: #0b1220;
+      color: var(--text);
+    }
+    .muted { color: var(--muted); }
+    .env-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(34,211,238,0.12);
+      color: #67e8f9;
+      font-size: 12px;
+      border: 1px solid rgba(34,211,238,0.25);
+    }
+    .project-title { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .spacer { height: 18px; }
+    .top-right { display: flex; align-items: center; gap: 12px; }
+    .danger { color: #fecaca; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="brand">
+        <div class="brand-badge"></div>
+        <div>
+          <div>Nexora</div>
+          <div class="muted" style="font-size:12px">Control Plane</div>
+        </div>
+      </div>
+      <div class="top-right">
+        {% if user %}
+          <span class="pill">{{ user.username }}</span>
+          <a class="btn ghost" href="/logout">Logout</a>
+        {% else %}
+          <span class="pill">Not signed in</span>
+        {% endif %}
+      </div>
+    </header>
+    {% block content %}{% endblock %}
+  </div>
+</body>
+</html>
