@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card" style="margin-bottom:16px;">
+  <div class="row" style="justify-content: space-between;">
+    <div>
+      <div class="project-title">Create a Project</div>
+      <div class="muted" style="font-size:12px;">This will auto-provision dev, staging, and prod environments.</div>
+    </div>
+    <form method="post" action="/projects" style="display:flex; gap:8px; align-items:center;">
+      <input class="input" type="text" name="slug" placeholder="project-name" required>
+      <button class="btn primary" type="submit">Create</button>
+    </form>
+  </div>
+</div>
+
+<div class="grid">
+  {% for project in projects %}
+  <div class="card">
+    <div class="row" style="justify-content: space-between;">
+      <div>
+        <div class="project-title">{{ project.slug }}</div>
+        <div class="muted" style="font-size:12px;">Owner: {{ project.owner.username }}</div>
+      </div>
+      <form method="post" action="/projects/{{ project.id }}/delete">
+        <button class="btn ghost danger" type="submit">Delete</button>
+      </form>
+    </div>
+    <div class="spacer"></div>
+    {% for env in project.envs %}
+      <div class="row" style="justify-content: space-between; margin-bottom:6px;">
+        <span class="env-pill">{{ env.name }}</span>
+        <a class="btn" href="https://{{ env.host }}" target="_blank">Open</a>
+      </div>
+      <div class="muted" style="font-size:12px;">{{ env.host }}</div>
+      <div class="spacer"></div>
+    {% endfor %}
+  </div>
+  {% endfor %}
+</div>
+{% endblock %}
