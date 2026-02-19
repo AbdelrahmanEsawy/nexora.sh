@@ -378,10 +378,12 @@ def logout(request: Request):
 
 @app.get("/auth/github")
 async def auth_github(request: Request):
-    if "github" not in oauth:
+    try:
+        client = oauth.github
+    except AttributeError:
         return HTMLResponse("GitHub OAuth not configured", status_code=500)
     redirect_uri = request.url_for("auth_callback")
-    return await oauth.github.authorize_redirect(request, redirect_uri)
+    return await client.authorize_redirect(request, redirect_uri)
 
 
 @app.get("/auth/github/callback")
