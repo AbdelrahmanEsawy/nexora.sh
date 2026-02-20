@@ -51,7 +51,7 @@
     </div>
     <div>
       <div class="muted" style="font-size:12px; margin-bottom:6px;">Filestore size (Gi)</div>
-      <input class="input" type="number" min="1" name="storage_gb" value="{{ project.storage_gb or 10 }}" />
+      <input class="input" type="number" min="1" name="storage_gb" value="{{ project.storage_gb or 1 }}" />
     </div>
     <div>
       <div class="muted" style="font-size:12px; margin-bottom:6px;">Staging branches</div>
@@ -144,35 +144,72 @@
     Use the base subdomain or attach custom domains per environment. Ensure DNS A records point to your ingress IP.
   </div>
 
-  {% for env in project.envs %}
+  {% set env_names = project.envs | map(attribute='name') | list %}
+  {% for env_name in ["prod","staging","dev"] %}
+    {% set env = (project.envs | selectattr("name","equalto", env_name) | list | first) %}
     <div class="card" style="margin-bottom:12px; background: #0b1220;">
       <div class="row" style="justify-content: space-between;">
         <div class="row">
-          <span class="env-pill">{{ env.name }}</span>
-          <span class="muted" style="font-size:12px;">{{ env.host }}</span>
+          <span class="env-pill">{{ env_name }}</span>
+          {% if env %}
+            <span class="muted" style="font-size:12px;">{{ env.host }}</span>
+          {% else %}
+            <span class="muted" style="font-size:12px;">Not created yet</span>
+          {% endif %}
         </div>
-        <a class="btn" href="https://{{ env.host }}" target="_blank">Open</a>
+        <div class="row">
+          {% if env %}
+            <a class="btn" href="https://{{ env.host }}" target="_blank">Open</a>
+          {% endif %}
+          {% if env_name != "dev" and env %}
+            <form method="post" action="/projects/{{ project.id }}/promote">
+              <input type="hidden" name="source_env" value="{{ "dev" if env_name == "staging" else "staging" }}" />
+              <input type="hidden" name="target_env" value="{{ env_name }}" />
+              <button class="btn ghost" type="submit">Promote</button>
+            </form>
+          {% elif env_name == "staging" and not env %}
+            <form method="post" action="/projects/{{ project.id }}/promote">
+              <input type="hidden" name="source_env" value="dev" />
+              <input type="hidden" name="target_env" value="staging" />
+              <button class="btn ghost" type="submit">Create</button>
+            </form>
+          {% elif env_name == "prod" and not env %}
+            <form method="post" action="/projects/{{ project.id }}/promote">
+              <input type="hidden" name="source_env" value="staging" />
+              <input type="hidden" name="target_env" value="prod" />
+              <button class="btn ghost" type="submit">Create</button>
+            </form>
+          {% endif %}
+          {% if env_name == "dev" and env %}
+            <form method="post" action="/projects/{{ project.id }}/reset">
+              <input type="hidden" name="env" value="dev" />
+              <button class="btn ghost danger" type="submit">Reset Dev</button>
+            </form>
+          {% endif %}
+        </div>
       </div>
       <div class="spacer"></div>
-      <div class="muted" style="font-size:12px; margin-bottom:6px;">Custom domains</div>
-      {% if env.domains %}
-        {% for domain in env.domains %}
-          <div class="row" style="justify-content: space-between; margin-bottom:6px;">
-            <span>{{ domain.host }}</span>
-            <form method="post" action="/projects/{{ project.id }}/domains/{{ domain.id }}/delete">
-              <button class="btn ghost danger" type="submit">Remove</button>
-            </form>
-          </div>
-        {% endfor %}
-      {% else %}
-        <div class="muted" style="font-size:12px;">No custom domains yet.</div>
+      {% if env %}
+        <div class="muted" style="font-size:12px; margin-bottom:6px;">Custom domains</div>
+        {% if env.domains %}
+          {% for domain in env.domains %}
+            <div class="row" style="justify-content: space-between; margin-bottom:6px;">
+              <span>{{ domain.host }}</span>
+              <form method="post" action="/projects/{{ project.id }}/domains/{{ domain.id }}/delete">
+                <button class="btn ghost danger" type="submit">Remove</button>
+              </form>
+            </div>
+          {% endfor %}
+        {% else %}
+          <div class="muted" style="font-size:12px;">No custom domains yet.</div>
+        {% endif %}
+        <div class="spacer"></div>
+        <form method="post" action="/projects/{{ project.id }}/domains" class="row">
+          <input type="hidden" name="env_id" value="{{ env.id }}" />
+          <input class="input" name="host" placeholder="custom.domain.com" required />
+          <button class="btn primary" type="submit">Add domain</button>
+        </form>
       {% endif %}
-      <div class="spacer"></div>
-      <form method="post" action="/projects/{{ project.id }}/domains" class="row">
-        <input type="hidden" name="env_id" value="{{ env.id }}" />
-        <input class="input" name="host" placeholder="custom.domain.com" required />
-        <button class="btn primary" type="submit">Add domain</button>
-      </form>
     </div>
   {% endfor %}
 </div>

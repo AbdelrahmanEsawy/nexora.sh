@@ -43,7 +43,7 @@ DEFAULT_DEV_BRANCH = os.getenv("DEFAULT_DEV_BRANCH", "dev")
 DEFAULT_STAGING_BRANCH = os.getenv("DEFAULT_STAGING_BRANCH", "staging")
 DEFAULT_PROD_BRANCH = os.getenv("DEFAULT_PROD_BRANCH", "main")
 DEFAULT_WORKERS = int(os.getenv("DEFAULT_WORKERS", "1"))
-DEFAULT_STORAGE_GB = int(os.getenv("DEFAULT_STORAGE_GB", "10"))
+DEFAULT_STORAGE_GB = int(os.getenv("DEFAULT_STORAGE_GB", "1"))
 DEFAULT_STAGING_SLOTS = int(os.getenv("DEFAULT_STAGING_SLOTS", "1"))
 DEFAULT_ODOO_VERSION = os.getenv("DEFAULT_ODOO_VERSION", "19.0")
 
@@ -415,6 +415,38 @@ def drop_db(db_name: str):
     conn.close()
 
 
+def clone_db(source: str, dest: str):
+    if source == dest:
+        return
+    conn = psycopg2.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        dbname="postgres",
+        sslmode=DB_SSLMODE,
+    )
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s;",
+            (source,),
+        )
+        cur.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s;",
+            (dest,),
+        )
+        cur.execute(sql.SQL("DROP DATABASE IF EXISTS {};").format(sql.Identifier(dest)))
+        cur.execute(
+            sql.SQL("CREATE DATABASE {} OWNER {} TEMPLATE {};").format(
+                sql.Identifier(dest),
+                sql.Identifier(DB_USER),
+                sql.Identifier(source),
+            )
+        )
+    conn.close()
+
+
 def kubectl_apply(manifest: str):
     proc = subprocess.run(
         ["kubectl", "-n", ODOO_NAMESPACE, "apply", "-f", "-"],
@@ -433,6 +465,59 @@ def kubectl_delete(kind: str, name: str):
         stderr=subprocess.PIPE,
         check=False,
     )
+
+
+def kubectl_wait(kind: str, name: str, timeout: str = "600s"):
+    subprocess.run(
+        ["kubectl", "-n", ODOO_NAMESPACE, "wait", "--for=condition=complete", kind, name, f"--timeout={timeout}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def run_filestore_job(name: str, src_pvc: str, dst_pvc: str, command: str):
+    manifest = f"""
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {name}
+  namespace: {ODOO_NAMESPACE}
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: worker
+          image: alpine:3.19
+          command: ["/bin/sh", "-c", "{command}"]
+          volumeMounts:
+            - name: src
+              mountPath: /src
+            - name: dst
+              mountPath: /dst
+      volumes:
+        - name: src
+          persistentVolumeClaim:
+            claimName: {src_pvc}
+        - name: dst
+          persistentVolumeClaim:
+            claimName: {dst_pvc}
+""".strip() + "\n"
+    kubectl_apply(manifest)
+    kubectl_wait("job", name)
+    kubectl_delete("job", name)
+
+
+def wipe_filestore(pvc_name: str):
+    job = f"wipe-{pvc_name[:45]}".lower()
+    run_filestore_job(job, pvc_name, pvc_name, "rm -rf /dst/*")
+
+
+def copy_filestore(src_pvc: str, dst_pvc: str):
+    job = f"copy-{src_pvc[:20]}-{dst_pvc[:20]}".lower().replace("_", "-")
+    run_filestore_job(job, src_pvc, dst_pvc, "rm -rf /dst/* && cp -a /src/. /dst/")
 
 
 def apply_domain_ingress(env: Environment, host: str):
@@ -643,6 +728,26 @@ spec:
     return host, db_name
 
 
+def reset_env(project: Project, env: str):
+    db_name = db_name_for(project.slug, env)
+    pvc_name = f"odoo-filestore-{project.slug}-{env}"
+    drop_db(db_name)
+    create_db(db_name)
+    wipe_filestore(pvc_name)
+    restart_env(project.slug, env)
+
+
+def promote_env(project: Project, source_env: str, target_env: str):
+    source_db = db_name_for(project.slug, source_env)
+    target_db = db_name_for(project.slug, target_env)
+    source_pvc = f"odoo-filestore-{project.slug}-{source_env}"
+    target_pvc = f"odoo-filestore-{project.slug}-{target_env}"
+
+    clone_db(source_db, target_db)
+    copy_filestore(source_pvc, target_pvc)
+    restart_env(project.slug, target_env)
+
+
 def delete_env(slug: str, env: str):
     name = f"odoo-{slug}-{env}"
     pvc_name = f"odoo-filestore-{slug}-{env}"
@@ -681,6 +786,9 @@ def index(request: Request):
             projects = db.query(Project).all()
         else:
             projects = db.query(Project).filter(Project.owner_id == user.id).all()
+        env_order = {"prod": 0, "staging": 1, "dev": 2}
+        for project in projects:
+            project.envs.sort(key=lambda e: env_order.get(e.name, 99))
         return templates.TemplateResponse(
             "dashboard.html",
             {
@@ -815,15 +923,13 @@ async def github_webhook(request: Request):
                     elif branch == (project.prod_branch or DEFAULT_PROD_BRANCH):
                         env = "prod"
                     if env:
-                        restart_env(project.slug, env)
-                        record_build_event(
-                            project.id,
-                            env,
-                            branch,
-                            sha,
-                            "deployed",
-                            f"Restarted {env} on push to {branch}",
-                        )
+                        if env == "dev":
+                            reset_env(project, env)
+                            msg = f"Reset dev on push to {branch}"
+                        else:
+                            restart_env(project.slug, env)
+                            msg = f"Restarted {env} on push to {branch}"
+                        record_build_event(project.id, env, branch, sha, "deployed", msg)
         return {"ok": True}
 
     return {"ok": True}
@@ -864,11 +970,9 @@ def create_project(request: Request, slug: str = Form(...), display_name: str = 
         db.commit()
         db.refresh(project)
 
-        envs = []
-        for env in ["dev", "staging", "prod"]:
-            host, db_name = provision_env(project, env)
-            envs.append(Environment(project_id=project.id, name=env, host=host, db_name=db_name))
-        db.add_all(envs)
+        # Create only dev by default (Odoo.sh-like: dev first).
+        host, db_name = provision_env(project, "dev")
+        db.add(Environment(project_id=project.id, name="dev", host=host, db_name=db_name))
         db.commit()
 
     return RedirectResponse("/", status_code=302)
@@ -915,6 +1019,8 @@ def project_settings(request: Request, project_id: int):
         if not project:
             return HTMLResponse("Not found", status_code=404)
         db.refresh(project)
+        env_order = {"prod": 0, "staging": 1, "dev": 2}
+        project.envs.sort(key=lambda e: env_order.get(e.name, 99))
         if user.is_admin:
             installations = db.query(Installation).order_by(Installation.installed_at.desc()).all()
         else:
@@ -990,7 +1096,7 @@ def update_project_settings(
         db.commit()
         db.refresh(project)
 
-        # Reconcile environments with new settings.
+        # Reconcile existing environments with new settings.
         for env in list(project.envs):
             provision_env(project, env.name)
 
@@ -1083,6 +1189,80 @@ def add_domain(
         db.refresh(domain)
 
         apply_domain_ingress(env, host)
+
+    return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
+
+
+@app.post("/projects/{project_id}/promote")
+def promote_project_env(
+    request: Request,
+    project_id: int,
+    source_env: str = Form(...),
+    target_env: str = Form(...),
+):
+    user = current_user(request)
+    if not user:
+        return RedirectResponse("/login")
+
+    if source_env not in {"dev", "staging", "prod"} or target_env not in {"dev", "staging", "prod"}:
+        return HTMLResponse("Invalid environment", status_code=400)
+    if source_env == target_env:
+        return HTMLResponse("Invalid promotion", status_code=400)
+
+    allowed = {("dev", "staging"), ("staging", "prod")}
+    if (source_env, target_env) not in allowed:
+        return HTMLResponse("Promotion order must be dev → staging → prod", status_code=400)
+
+    with db_session() as db:
+        project = get_project_for_user(db, user, project_id)
+        if not project:
+            return HTMLResponse("Not found", status_code=404)
+
+        envs = {e.name: e for e in project.envs}
+        if source_env not in envs:
+            return HTMLResponse("Source environment missing", status_code=400)
+
+        if target_env not in envs:
+            host, db_name = provision_env(project, target_env)
+            env_obj = Environment(project_id=project.id, name=target_env, host=host, db_name=db_name)
+            db.add(env_obj)
+            db.commit()
+            db.refresh(env_obj)
+            envs[target_env] = env_obj
+
+        promote_env(project, source_env, target_env)
+
+        record_build_event(
+            project.id,
+            target_env,
+            "",
+            "",
+            "promoted",
+            f"Promoted {source_env} → {target_env}",
+        )
+
+    return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
+
+
+@app.post("/projects/{project_id}/reset")
+def reset_project_env(
+    request: Request,
+    project_id: int,
+    env: str = Form(...),
+):
+    user = current_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    if env not in {"dev"}:
+        return HTMLResponse("Only dev can be reset", status_code=400)
+
+    with db_session() as db:
+        project = get_project_for_user(db, user, project_id)
+        if not project:
+            return HTMLResponse("Not found", status_code=404)
+
+        reset_env(project, env)
+        record_build_event(project.id, env, "", "", "reset", "Dev reset")
 
     return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
 
