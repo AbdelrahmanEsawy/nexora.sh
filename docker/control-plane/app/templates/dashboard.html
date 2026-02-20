@@ -7,7 +7,8 @@
       <div class="muted" style="font-size:12px;">This will auto-provision dev, staging, and prod environments.</div>
     </div>
     <form method="post" action="/projects" style="display:flex; gap:8px; align-items:center;">
-      <input class="input" type="text" name="slug" placeholder="project-name" required>
+      <input class="input" type="text" name="display_name" placeholder="Project name (display)" required>
+      <input class="input" type="text" name="slug" placeholder="project-slug" required>
       <button class="btn primary" type="submit">Create</button>
     </form>
   </div>
@@ -18,12 +19,15 @@
   <div class="card">
     <div class="row" style="justify-content: space-between;">
       <div>
-        <div class="project-title">{{ project.slug }}</div>
-        <div class="muted" style="font-size:12px;">Owner: {{ project.owner.username }}</div>
+        <div class="project-title">{{ project.display_name or project.slug }}</div>
+        <div class="muted" style="font-size:12px;">Slug: {{ project.slug }} · Owner: {{ project.owner.username }}</div>
       </div>
-      <form method="post" action="/projects/{{ project.id }}/delete">
-        <button class="btn ghost danger" type="submit">Delete</button>
-      </form>
+      <div class="row">
+        <a class="btn" href="/projects/{{ project.id }}/settings">Settings</a>
+        <form method="post" action="/projects/{{ project.id }}/delete">
+          <button class="btn ghost danger" type="submit">Delete</button>
+        </form>
+      </div>
     </div>
     <div class="spacer"></div>
     {% for env in project.envs %}
