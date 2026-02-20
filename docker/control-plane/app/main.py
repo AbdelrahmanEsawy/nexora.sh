@@ -1,10 +1,13 @@
 import hashlib
+import hmac
 import os
 import re
 import subprocess
+import time
 from datetime import datetime
 from typing import Optional
 
+import httpx
 import psycopg2
 from psycopg2 import sql
 from authlib.integrations.starlette_client import OAuth
@@ -15,6 +18,7 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, create_engine, text
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from starlette.middleware.sessions import SessionMiddleware
+import jwt
 
 BASE_DOMAIN = os.getenv("BASE_DOMAIN", "nexora.red")
 ODOO_NAMESPACE = os.getenv("ODOO_NAMESPACE", "odoo-system")
@@ -30,11 +34,16 @@ DB_SSLMODE = os.getenv("DB_SSLMODE", "require")
 
 APP_SECRET = os.getenv("APP_SECRET", "change-me")
 
+GITHUB_APP_ID = os.getenv("GITHUB_APP_ID")
+GITHUB_APP_PRIVATE_KEY = os.getenv("GITHUB_APP_PRIVATE_KEY")
+GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET")
+GITHUB_APP_SLUG = os.getenv("GITHUB_APP_SLUG", "nexora-platform")
+
 DEFAULT_DEV_BRANCH = os.getenv("DEFAULT_DEV_BRANCH", "dev")
 DEFAULT_STAGING_BRANCH = os.getenv("DEFAULT_STAGING_BRANCH", "staging")
 DEFAULT_PROD_BRANCH = os.getenv("DEFAULT_PROD_BRANCH", "main")
 DEFAULT_WORKERS = int(os.getenv("DEFAULT_WORKERS", "1"))
-DEFAULT_STORAGE_GB = int(os.getenv("DEFAULT_STORAGE_GB", "10"))
+DEFAULT_STORAGE_GB = int(os.getenv("DEFAULT_STORAGE_GB", "1"))
 DEFAULT_STAGING_SLOTS = int(os.getenv("DEFAULT_STAGING_SLOTS", "1"))
 DEFAULT_ODOO_VERSION = os.getenv("DEFAULT_ODOO_VERSION", "19.0")
 
@@ -70,6 +79,9 @@ class Project(Base):
     staging_slots = Column(Integer, default=DEFAULT_STAGING_SLOTS)
     subscription_code = Column(String, nullable=True)
     odoo_version = Column(String, nullable=True)
+    repo_full_name = Column(String, nullable=True)
+    repo_id = Column(String, nullable=True)
+    installation_id = Column(String, nullable=True)
     owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     owner = relationship("User", back_populates="projects")
@@ -97,6 +109,38 @@ class Domain(Base):
     environment = relationship("Environment", back_populates="domains")
 
 
+class Installation(Base):
+    __tablename__ = "installations"
+    id = Column(Integer, primary_key=True)
+    installation_id = Column(String, unique=True, nullable=False)
+    account_login = Column(String, nullable=False)
+    account_id = Column(String, nullable=True)
+    installed_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Repository(Base):
+    __tablename__ = "repositories"
+    id = Column(Integer, primary_key=True)
+    installation_id = Column(String, nullable=False)
+    repo_id = Column(String, nullable=False)
+    full_name = Column(String, unique=True, nullable=False)
+    default_branch = Column(String, nullable=True)
+    private = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class BuildEvent(Base):
+    __tablename__ = "build_events"
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, nullable=False)
+    env = Column(String, nullable=True)
+    branch = Column(String, nullable=True)
+    sha = Column(String, nullable=True)
+    status = Column(String, nullable=True)
+    message = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 Base.metadata.create_all(engine)
 
 
@@ -113,6 +157,9 @@ def ensure_schema():
             ("staging_slots", "staging_slots INTEGER"),
             ("subscription_code", "subscription_code TEXT"),
             ("odoo_version", "odoo_version TEXT"),
+            ("repo_full_name", "repo_full_name TEXT"),
+            ("repo_id", "repo_id TEXT"),
+            ("installation_id", "installation_id TEXT"),
         ]:
             if name not in cols:
                 conn.execute(text(f"ALTER TABLE projects ADD COLUMN {ddl}"))
@@ -173,6 +220,115 @@ if GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET:
 
 
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,30}$")
+
+
+def github_app_enabled() -> bool:
+    return bool(GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY and GITHUB_WEBHOOK_SECRET)
+
+
+def github_app_jwt() -> str:
+    if not GITHUB_APP_ID or not GITHUB_APP_PRIVATE_KEY:
+        raise RuntimeError("GitHub App credentials are missing")
+    now = int(time.time())
+    payload = {"iat": now - 60, "exp": now + 600, "iss": GITHUB_APP_ID}
+    token = jwt.encode(payload, GITHUB_APP_PRIVATE_KEY, algorithm="RS256")
+    return token
+
+
+def github_app_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {github_app_jwt()}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def github_installation_token(installation_id: str) -> str:
+    url = f"https://api.github.com/app/installations/{installation_id}/access_tokens"
+    resp = httpx.post(url, headers=github_app_headers(), timeout=20)
+    resp.raise_for_status()
+    return resp.json()["token"]
+
+
+def github_install_url() -> str:
+    return f"https://github.com/apps/{GITHUB_APP_SLUG}/installations/new"
+
+
+def verify_github_signature(secret: str, body: bytes, signature: str) -> bool:
+    if not signature or not signature.startswith("sha256="):
+        return False
+    digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    expected = f"sha256={digest}"
+    return hmac.compare_digest(expected, signature)
+
+
+def sync_installation_repos(installation_id: str):
+    token = github_installation_token(installation_id)
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    url = "https://api.github.com/installation/repositories"
+    resp = httpx.get(url, headers=headers, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    repos = data.get("repositories", [])
+    with db_session() as db:
+        for repo in repos:
+            full_name = repo.get("full_name")
+            repo_id = str(repo.get("id"))
+            if not full_name or not repo_id:
+                continue
+            existing = db.query(Repository).filter(Repository.full_name == full_name).first()
+            if existing:
+                existing.installation_id = installation_id
+                existing.default_branch = repo.get("default_branch")
+                existing.private = bool(repo.get("private"))
+            else:
+                db.add(
+                    Repository(
+                        installation_id=installation_id,
+                        repo_id=repo_id,
+                        full_name=full_name,
+                        default_branch=repo.get("default_branch"),
+                        private=bool(repo.get("private")),
+                    )
+                )
+        db.commit()
+
+
+def record_build_event(project_id: int, env: str, branch: str, sha: str, status: str, message: str):
+    with db_session() as db:
+        db.add(
+            BuildEvent(
+                project_id=project_id,
+                env=env,
+                branch=branch,
+                sha=sha,
+                status=status,
+                message=message,
+            )
+        )
+        db.commit()
+
+
+def branch_from_ref(ref: str) -> str:
+    if not ref:
+        return ""
+    if ref.startswith("refs/heads/"):
+        return ref.split("/", 2)[2]
+    return ref.split("/")[-1]
+
+
+def restart_env(slug: str, env: str):
+    name = f"odoo-{slug}-{env}"
+    subprocess.run(
+        ["kubectl", "-n", ODOO_NAMESPACE, "rollout", "restart", "deployment", name],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
 
 
 def db_session():
@@ -259,6 +415,38 @@ def drop_db(db_name: str):
     conn.close()
 
 
+def clone_db(source: str, dest: str):
+    if source == dest:
+        return
+    conn = psycopg2.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        dbname="postgres",
+        sslmode=DB_SSLMODE,
+    )
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s;",
+            (source,),
+        )
+        cur.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s;",
+            (dest,),
+        )
+        cur.execute(sql.SQL("DROP DATABASE IF EXISTS {};").format(sql.Identifier(dest)))
+        cur.execute(
+            sql.SQL("CREATE DATABASE {} OWNER {} TEMPLATE {};").format(
+                sql.Identifier(dest),
+                sql.Identifier(DB_USER),
+                sql.Identifier(source),
+            )
+        )
+    conn.close()
+
+
 def kubectl_apply(manifest: str):
     proc = subprocess.run(
         ["kubectl", "-n", ODOO_NAMESPACE, "apply", "-f", "-"],
@@ -277,6 +465,59 @@ def kubectl_delete(kind: str, name: str):
         stderr=subprocess.PIPE,
         check=False,
     )
+
+
+def kubectl_wait(kind: str, name: str, timeout: str = "600s"):
+    subprocess.run(
+        ["kubectl", "-n", ODOO_NAMESPACE, "wait", "--for=condition=complete", kind, name, f"--timeout={timeout}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def run_filestore_job(name: str, src_pvc: str, dst_pvc: str, command: str):
+    manifest = f"""
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {name}
+  namespace: {ODOO_NAMESPACE}
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: worker
+          image: alpine:3.19
+          command: ["/bin/sh", "-c", "{command}"]
+          volumeMounts:
+            - name: src
+              mountPath: /src
+            - name: dst
+              mountPath: /dst
+      volumes:
+        - name: src
+          persistentVolumeClaim:
+            claimName: {src_pvc}
+        - name: dst
+          persistentVolumeClaim:
+            claimName: {dst_pvc}
+""".strip() + "\n"
+    kubectl_apply(manifest)
+    kubectl_wait("job", name)
+    kubectl_delete("job", name)
+
+
+def wipe_filestore(pvc_name: str):
+    job = f"wipe-{pvc_name[:45]}".lower()
+    run_filestore_job(job, pvc_name, pvc_name, "rm -rf /dst/*")
+
+
+def copy_filestore(src_pvc: str, dst_pvc: str):
+    job = f"copy-{src_pvc[:20]}-{dst_pvc[:20]}".lower().replace("_", "-")
+    run_filestore_job(job, src_pvc, dst_pvc, "rm -rf /dst/* && cp -a /src/. /dst/")
 
 
 def apply_domain_ingress(env: Environment, host: str):
@@ -487,6 +728,26 @@ spec:
     return host, db_name
 
 
+def reset_env(project: Project, env: str):
+    db_name = db_name_for(project.slug, env)
+    pvc_name = f"odoo-filestore-{project.slug}-{env}"
+    drop_db(db_name)
+    create_db(db_name)
+    wipe_filestore(pvc_name)
+    restart_env(project.slug, env)
+
+
+def promote_env(project: Project, source_env: str, target_env: str):
+    source_db = db_name_for(project.slug, source_env)
+    target_db = db_name_for(project.slug, target_env)
+    source_pvc = f"odoo-filestore-{project.slug}-{source_env}"
+    target_pvc = f"odoo-filestore-{project.slug}-{target_env}"
+
+    clone_db(source_db, target_db)
+    copy_filestore(source_pvc, target_pvc)
+    restart_env(project.slug, target_env)
+
+
 def delete_env(slug: str, env: str):
     name = f"odoo-{slug}-{env}"
     pvc_name = f"odoo-filestore-{slug}-{env}"
@@ -525,6 +786,9 @@ def index(request: Request):
             projects = db.query(Project).all()
         else:
             projects = db.query(Project).filter(Project.owner_id == user.id).all()
+        env_order = {"prod": 0, "staging": 1, "dev": 2}
+        for project in projects:
+            project.envs.sort(key=lambda e: env_order.get(e.name, 99))
         return templates.TemplateResponse(
             "dashboard.html",
             {
@@ -547,6 +811,11 @@ def login(request: Request):
 def logout(request: Request):
     request.session.clear()
     return RedirectResponse("/login")
+
+
+@app.get("/github/install")
+def github_install(request: Request):
+    return RedirectResponse(github_install_url())
 
 
 @app.get("/auth/github")
@@ -591,6 +860,81 @@ async def auth_callback(request: Request):
     return RedirectResponse("/")
 
 
+@app.post("/webhooks/github")
+async def github_webhook(request: Request):
+    if not GITHUB_WEBHOOK_SECRET:
+        return HTMLResponse("Webhook secret not configured", status_code=500)
+    body = await request.body()
+    signature = request.headers.get("X-Hub-Signature-256", "")
+    if not verify_github_signature(GITHUB_WEBHOOK_SECRET, body, signature):
+        return HTMLResponse("Invalid signature", status_code=401)
+
+    event = request.headers.get("X-GitHub-Event", "")
+    payload = await request.json()
+
+    if event == "ping":
+        return {"ok": True}
+
+    if event in {"installation", "installation_repositories"}:
+        installation = payload.get("installation", {})
+        installation_id = str(installation.get("id") or "")
+        account = installation.get("account") or payload.get("sender") or {}
+        account_login = account.get("login") or ""
+        account_id = str(account.get("id") or "")
+        if installation_id and account_login:
+            with db_session() as db:
+                existing = db.query(Installation).filter(
+                    Installation.installation_id == installation_id
+                ).first()
+                if existing:
+                    existing.account_login = account_login
+                    existing.account_id = account_id
+                else:
+                    db.add(
+                        Installation(
+                            installation_id=installation_id,
+                            account_login=account_login,
+                            account_id=account_id,
+                        )
+                    )
+                db.commit()
+            try:
+                sync_installation_repos(installation_id)
+            except Exception:
+                pass
+        return {"ok": True}
+
+    if event == "push":
+        repo = payload.get("repository", {})
+        full_name = repo.get("full_name")
+        ref = payload.get("ref", "")
+        branch = branch_from_ref(ref)
+        sha = payload.get("after") or ""
+
+        if full_name and branch:
+            with db_session() as db:
+                project = db.query(Project).filter(Project.repo_full_name == full_name).first()
+                if project:
+                    env = None
+                    if branch == (project.dev_branch or DEFAULT_DEV_BRANCH):
+                        env = "dev"
+                    elif branch == (project.staging_branch or DEFAULT_STAGING_BRANCH):
+                        env = "staging"
+                    elif branch == (project.prod_branch or DEFAULT_PROD_BRANCH):
+                        env = "prod"
+                    if env:
+                        if env == "dev":
+                            reset_env(project, env)
+                            msg = f"Reset dev on push to {branch}"
+                        else:
+                            restart_env(project.slug, env)
+                            msg = f"Restarted {env} on push to {branch}"
+                        record_build_event(project.id, env, branch, sha, "deployed", msg)
+        return {"ok": True}
+
+    return {"ok": True}
+
+
 @app.post("/projects")
 def create_project(request: Request, slug: str = Form(...), display_name: str = Form(None)):
     user = current_user(request)
@@ -626,11 +970,9 @@ def create_project(request: Request, slug: str = Form(...), display_name: str = 
         db.commit()
         db.refresh(project)
 
-        envs = []
-        for env in ["dev", "staging", "prod"]:
-            host, db_name = provision_env(project, env)
-            envs.append(Environment(project_id=project.id, name=env, host=host, db_name=db_name))
-        db.add_all(envs)
+        # Create only dev by default (Odoo.sh-like: dev first).
+        host, db_name = provision_env(project, "dev")
+        db.add(Environment(project_id=project.id, name="dev", host=host, db_name=db_name))
         db.commit()
 
     return RedirectResponse("/", status_code=302)
@@ -677,6 +1019,33 @@ def project_settings(request: Request, project_id: int):
         if not project:
             return HTMLResponse("Not found", status_code=404)
         db.refresh(project)
+        env_order = {"prod": 0, "staging": 1, "dev": 2}
+        project.envs.sort(key=lambda e: env_order.get(e.name, 99))
+        if user.is_admin:
+            installations = db.query(Installation).order_by(Installation.installed_at.desc()).all()
+        else:
+            installations = (
+                db.query(Installation)
+                .filter(Installation.account_login == user.username)
+                .order_by(Installation.installed_at.desc())
+                .all()
+            )
+        install_ids = [i.installation_id for i in installations]
+        repos = []
+        if install_ids:
+            repos = (
+                db.query(Repository)
+                .filter(Repository.installation_id.in_(install_ids))
+                .order_by(Repository.full_name.asc())
+                .all()
+            )
+        builds = (
+            db.query(BuildEvent)
+            .filter(BuildEvent.project_id == project.id)
+            .order_by(BuildEvent.created_at.desc())
+            .limit(10)
+            .all()
+        )
         return templates.TemplateResponse(
             "project_settings.html",
             {
@@ -684,6 +1053,10 @@ def project_settings(request: Request, project_id: int):
                 "user": user,
                 "project": project,
                 "base_domain": BASE_DOMAIN,
+                "installations": installations,
+                "repos": repos,
+                "builds": builds,
+                "github_install_url": github_install_url(),
             },
         )
 
@@ -723,9 +1096,63 @@ def update_project_settings(
         db.commit()
         db.refresh(project)
 
-        # Reconcile environments with new settings.
+        # Reconcile existing environments with new settings.
         for env in list(project.envs):
             provision_env(project, env.name)
+
+    return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
+
+
+@app.post("/projects/{project_id}/repo")
+def connect_repo(
+    request: Request,
+    project_id: int,
+    repo_full_name: str = Form(...),
+    installation_id: str = Form(""),
+):
+    user = current_user(request)
+    if not user:
+        return RedirectResponse("/login")
+
+    repo_full_name = repo_full_name.strip()
+    if not repo_full_name or "/" not in repo_full_name:
+        return HTMLResponse("Invalid repository name", status_code=400)
+
+    with db_session() as db:
+        project = get_project_for_user(db, user, project_id)
+        if not project:
+            return HTMLResponse("Not found", status_code=404)
+
+        if not installation_id:
+            # Auto-select if exactly one installation matches this user.
+            q = db.query(Installation)
+            if not user.is_admin:
+                q = q.filter(Installation.account_login == user.username)
+            installs = q.all()
+            if len(installs) == 1:
+                installation_id = installs[0].installation_id
+
+        if not installation_id:
+            return HTMLResponse("Installation ID required", status_code=400)
+
+        # Verify access via GitHub App installation token.
+        try:
+            token = github_installation_token(installation_id)
+            headers = {
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            }
+            resp = httpx.get(f"https://api.github.com/repos/{repo_full_name}", headers=headers, timeout=20)
+            resp.raise_for_status()
+            repo = resp.json()
+        except Exception:
+            return HTMLResponse("Unable to access repository with this installation", status_code=400)
+
+        project.repo_full_name = repo_full_name
+        project.repo_id = str(repo.get("id"))
+        project.installation_id = str(installation_id)
+        db.commit()
 
     return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
 
@@ -762,6 +1189,80 @@ def add_domain(
         db.refresh(domain)
 
         apply_domain_ingress(env, host)
+
+    return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
+
+
+@app.post("/projects/{project_id}/promote")
+def promote_project_env(
+    request: Request,
+    project_id: int,
+    source_env: str = Form(...),
+    target_env: str = Form(...),
+):
+    user = current_user(request)
+    if not user:
+        return RedirectResponse("/login")
+
+    if source_env not in {"dev", "staging", "prod"} or target_env not in {"dev", "staging", "prod"}:
+        return HTMLResponse("Invalid environment", status_code=400)
+    if source_env == target_env:
+        return HTMLResponse("Invalid promotion", status_code=400)
+
+    allowed = {("dev", "staging"), ("staging", "prod")}
+    if (source_env, target_env) not in allowed:
+        return HTMLResponse("Promotion order must be dev → staging → prod", status_code=400)
+
+    with db_session() as db:
+        project = get_project_for_user(db, user, project_id)
+        if not project:
+            return HTMLResponse("Not found", status_code=404)
+
+        envs = {e.name: e for e in project.envs}
+        if source_env not in envs:
+            return HTMLResponse("Source environment missing", status_code=400)
+
+        if target_env not in envs:
+            host, db_name = provision_env(project, target_env)
+            env_obj = Environment(project_id=project.id, name=target_env, host=host, db_name=db_name)
+            db.add(env_obj)
+            db.commit()
+            db.refresh(env_obj)
+            envs[target_env] = env_obj
+
+        promote_env(project, source_env, target_env)
+
+        record_build_event(
+            project.id,
+            target_env,
+            "",
+            "",
+            "promoted",
+            f"Promoted {source_env} → {target_env}",
+        )
+
+    return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
+
+
+@app.post("/projects/{project_id}/reset")
+def reset_project_env(
+    request: Request,
+    project_id: int,
+    env: str = Form(...),
+):
+    user = current_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    if env not in {"dev"}:
+        return HTMLResponse("Only dev can be reset", status_code=400)
+
+    with db_session() as db:
+        project = get_project_for_user(db, user, project_id)
+        if not project:
+            return HTMLResponse("Not found", status_code=404)
+
+        reset_env(project, env)
+        record_build_event(project.id, env, "", "", "reset", "Dev reset")
 
     return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
 
