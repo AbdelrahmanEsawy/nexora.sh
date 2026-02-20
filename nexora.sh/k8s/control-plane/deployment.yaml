@@ -64,6 +64,23 @@ spec:
                 secretKeyRef:
                   name: nexora-github
                   key: GITHUB_CLIENT_SECRET
+            - name: GITHUB_APP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-github
+                  key: GITHUB_APP_ID
+            - name: GITHUB_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-github
+                  key: GITHUB_WEBHOOK_SECRET
+            - name: GITHUB_APP_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-github
+                  key: private_key
+            - name: GITHUB_APP_SLUG
+              value: nexora-platform
             - name: DB_HOST
               valueFrom:
                 secretKeyRef:

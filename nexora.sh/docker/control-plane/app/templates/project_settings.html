@@ -78,6 +78,66 @@
   </div>
 </form>
 
+<div class="card" style="margin-bottom:16px;">
+  <div class="row" style="justify-content: space-between;">
+    <div>
+      <div class="project-title">GitHub</div>
+      <div class="muted" style="font-size:12px;">Connect a repository to enable branch-based deployments.</div>
+    </div>
+    <a class="btn" href="{{ github_install_url }}" target="_blank">Install GitHub App</a>
+  </div>
+  <div class="spacer"></div>
+  <form method="post" action="/projects/{{ project.id }}/repo">
+    <div class="grid">
+      <div>
+        <div class="muted" style="font-size:12px; margin-bottom:6px;">Repository (owner/name)</div>
+        <input class="input" name="repo_full_name" value="{{ project.repo_full_name or '' }}" list="repo-list" />
+        <datalist id="repo-list">
+          {% for repo in repos %}
+            <option value="{{ repo.full_name }}"></option>
+          {% endfor %}
+        </datalist>
+      </div>
+      <div>
+        <div class="muted" style="font-size:12px; margin-bottom:6px;">Installation</div>
+        <select class="input" name="installation_id">
+          <option value="">Select installation</option>
+          {% for inst in installations %}
+            <option value="{{ inst.installation_id }}" {% if project.installation_id == inst.installation_id %}selected{% endif %}>
+              {{ inst.account_login }} ({{ inst.installation_id }})
+            </option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+    <div class="spacer"></div>
+    <div class="row" style="justify-content: flex-end;">
+      <button class="btn primary" type="submit">Connect repository</button>
+    </div>
+  </form>
+
+  {% if project.repo_full_name %}
+  <div class="spacer"></div>
+  <div class="muted" style="font-size:12px;">Connected repository: <strong>{{ project.repo_full_name }}</strong></div>
+  {% endif %}
+</div>
+
+<div class="card" style="margin-bottom:16px;">
+  <div class="project-title">Recent Builds</div>
+  {% if builds %}
+    {% for build in builds %}
+      <div class="row" style="justify-content: space-between; margin-bottom:6px;">
+        <span class="muted" style="font-size:12px;">{{ build.created_at.strftime('%Y-%m-%d %H:%M') }}</span>
+        <span>{{ build.branch or 'n/a' }} → {{ build.env or 'n/a' }}</span>
+        <span class="muted" style="font-size:12px;">{{ build.status or '' }}</span>
+      </div>
+      <div class="muted" style="font-size:12px; margin-bottom:10px;">{{ build.message or '' }}</div>
+    {% endfor %}
+  {% else %}
+    <div class="muted" style="font-size:12px;">No builds yet.</div>
+  {% endif %}
+</div>
+
 <div class="card">
   <div class="project-title">Environments & Domains</div>
   <div class="muted" style="font-size:12px; margin-bottom:12px;">

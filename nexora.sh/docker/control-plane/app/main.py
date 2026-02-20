@@ -1,10 +1,13 @@
 import hashlib
+import hmac
 import os
 import re
 import subprocess
+import time
 from datetime import datetime
 from typing import Optional
 
+import httpx
 import psycopg2
 from psycopg2 import sql
 from authlib.integrations.starlette_client import OAuth
@@ -15,6 +18,7 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, create_engine, text
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from starlette.middleware.sessions import SessionMiddleware
+import jwt
 
 BASE_DOMAIN = os.getenv("BASE_DOMAIN", "nexora.red")
 ODOO_NAMESPACE = os.getenv("ODOO_NAMESPACE", "odoo-system")
@@ -29,6 +33,11 @@ DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_SSLMODE = os.getenv("DB_SSLMODE", "require")
 
 APP_SECRET = os.getenv("APP_SECRET", "change-me")
+
+GITHUB_APP_ID = os.getenv("GITHUB_APP_ID")
+GITHUB_APP_PRIVATE_KEY = os.getenv("GITHUB_APP_PRIVATE_KEY")
+GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET")
+GITHUB_APP_SLUG = os.getenv("GITHUB_APP_SLUG", "nexora-platform")
 
 DEFAULT_DEV_BRANCH = os.getenv("DEFAULT_DEV_BRANCH", "dev")
 DEFAULT_STAGING_BRANCH = os.getenv("DEFAULT_STAGING_BRANCH", "staging")
@@ -70,6 +79,9 @@ class Project(Base):
     staging_slots = Column(Integer, default=DEFAULT_STAGING_SLOTS)
     subscription_code = Column(String, nullable=True)
     odoo_version = Column(String, nullable=True)
+    repo_full_name = Column(String, nullable=True)
+    repo_id = Column(String, nullable=True)
+    installation_id = Column(String, nullable=True)
     owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     owner = relationship("User", back_populates="projects")
@@ -97,6 +109,38 @@ class Domain(Base):
     environment = relationship("Environment", back_populates="domains")
 
 
+class Installation(Base):
+    __tablename__ = "installations"
+    id = Column(Integer, primary_key=True)
+    installation_id = Column(String, unique=True, nullable=False)
+    account_login = Column(String, nullable=False)
+    account_id = Column(String, nullable=True)
+    installed_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Repository(Base):
+    __tablename__ = "repositories"
+    id = Column(Integer, primary_key=True)
+    installation_id = Column(String, nullable=False)
+    repo_id = Column(String, nullable=False)
+    full_name = Column(String, unique=True, nullable=False)
+    default_branch = Column(String, nullable=True)
+    private = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class BuildEvent(Base):
+    __tablename__ = "build_events"
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, nullable=False)
+    env = Column(String, nullable=True)
+    branch = Column(String, nullable=True)
+    sha = Column(String, nullable=True)
+    status = Column(String, nullable=True)
+    message = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 Base.metadata.create_all(engine)
 
 
@@ -113,6 +157,9 @@ def ensure_schema():
             ("staging_slots", "staging_slots INTEGER"),
             ("subscription_code", "subscription_code TEXT"),
             ("odoo_version", "odoo_version TEXT"),
+            ("repo_full_name", "repo_full_name TEXT"),
+            ("repo_id", "repo_id TEXT"),
+            ("installation_id", "installation_id TEXT"),
         ]:
             if name not in cols:
                 conn.execute(text(f"ALTER TABLE projects ADD COLUMN {ddl}"))
@@ -173,6 +220,115 @@ if GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET:
 
 
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,30}$")
+
+
+def github_app_enabled() -> bool:
+    return bool(GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY and GITHUB_WEBHOOK_SECRET)
+
+
+def github_app_jwt() -> str:
+    if not GITHUB_APP_ID or not GITHUB_APP_PRIVATE_KEY:
+        raise RuntimeError("GitHub App credentials are missing")
+    now = int(time.time())
+    payload = {"iat": now - 60, "exp": now + 600, "iss": GITHUB_APP_ID}
+    token = jwt.encode(payload, GITHUB_APP_PRIVATE_KEY, algorithm="RS256")
+    return token
+
+
+def github_app_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {github_app_jwt()}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def github_installation_token(installation_id: str) -> str:
+    url = f"https://api.github.com/app/installations/{installation_id}/access_tokens"
+    resp = httpx.post(url, headers=github_app_headers(), timeout=20)
+    resp.raise_for_status()
+    return resp.json()["token"]
+
+
+def github_install_url() -> str:
+    return f"https://github.com/apps/{GITHUB_APP_SLUG}/installations/new"
+
+
+def verify_github_signature(secret: str, body: bytes, signature: str) -> bool:
+    if not signature or not signature.startswith("sha256="):
+        return False
+    digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    expected = f"sha256={digest}"
+    return hmac.compare_digest(expected, signature)
+
+
+def sync_installation_repos(installation_id: str):
+    token = github_installation_token(installation_id)
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    url = "https://api.github.com/installation/repositories"
+    resp = httpx.get(url, headers=headers, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    repos = data.get("repositories", [])
+    with db_session() as db:
+        for repo in repos:
+            full_name = repo.get("full_name")
+            repo_id = str(repo.get("id"))
+            if not full_name or not repo_id:
+                continue
+            existing = db.query(Repository).filter(Repository.full_name == full_name).first()
+            if existing:
+                existing.installation_id = installation_id
+                existing.default_branch = repo.get("default_branch")
+                existing.private = bool(repo.get("private"))
+            else:
+                db.add(
+                    Repository(
+                        installation_id=installation_id,
+                        repo_id=repo_id,
+                        full_name=full_name,
+                        default_branch=repo.get("default_branch"),
+                        private=bool(repo.get("private")),
+                    )
+                )
+        db.commit()
+
+
+def record_build_event(project_id: int, env: str, branch: str, sha: str, status: str, message: str):
+    with db_session() as db:
+        db.add(
+            BuildEvent(
+                project_id=project_id,
+                env=env,
+                branch=branch,
+                sha=sha,
+                status=status,
+                message=message,
+            )
+        )
+        db.commit()
+
+
+def branch_from_ref(ref: str) -> str:
+    if not ref:
+        return ""
+    if ref.startswith("refs/heads/"):
+        return ref.split("/", 2)[2]
+    return ref.split("/")[-1]
+
+
+def restart_env(slug: str, env: str):
+    name = f"odoo-{slug}-{env}"
+    subprocess.run(
+        ["kubectl", "-n", ODOO_NAMESPACE, "rollout", "restart", "deployment", name],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
 
 
 def db_session():
@@ -549,6 +705,11 @@ def logout(request: Request):
     return RedirectResponse("/login")
 
 
+@app.get("/github/install")
+def github_install(request: Request):
+    return RedirectResponse(github_install_url())
+
+
 @app.get("/auth/github")
 async def auth_github(request: Request):
     try:
@@ -589,6 +750,83 @@ async def auth_callback(request: Request):
             db.refresh(user)
         request.session["user_id"] = user.id
     return RedirectResponse("/")
+
+
+@app.post("/webhooks/github")
+async def github_webhook(request: Request):
+    if not GITHUB_WEBHOOK_SECRET:
+        return HTMLResponse("Webhook secret not configured", status_code=500)
+    body = await request.body()
+    signature = request.headers.get("X-Hub-Signature-256", "")
+    if not verify_github_signature(GITHUB_WEBHOOK_SECRET, body, signature):
+        return HTMLResponse("Invalid signature", status_code=401)
+
+    event = request.headers.get("X-GitHub-Event", "")
+    payload = await request.json()
+
+    if event == "ping":
+        return {"ok": True}
+
+    if event in {"installation", "installation_repositories"}:
+        installation = payload.get("installation", {})
+        installation_id = str(installation.get("id") or "")
+        account = installation.get("account") or payload.get("sender") or {}
+        account_login = account.get("login") or ""
+        account_id = str(account.get("id") or "")
+        if installation_id and account_login:
+            with db_session() as db:
+                existing = db.query(Installation).filter(
+                    Installation.installation_id == installation_id
+                ).first()
+                if existing:
+                    existing.account_login = account_login
+                    existing.account_id = account_id
+                else:
+                    db.add(
+                        Installation(
+                            installation_id=installation_id,
+                            account_login=account_login,
+                            account_id=account_id,
+                        )
+                    )
+                db.commit()
+            try:
+                sync_installation_repos(installation_id)
+            except Exception:
+                pass
+        return {"ok": True}
+
+    if event == "push":
+        repo = payload.get("repository", {})
+        full_name = repo.get("full_name")
+        ref = payload.get("ref", "")
+        branch = branch_from_ref(ref)
+        sha = payload.get("after") or ""
+
+        if full_name and branch:
+            with db_session() as db:
+                project = db.query(Project).filter(Project.repo_full_name == full_name).first()
+                if project:
+                    env = None
+                    if branch == (project.dev_branch or DEFAULT_DEV_BRANCH):
+                        env = "dev"
+                    elif branch == (project.staging_branch or DEFAULT_STAGING_BRANCH):
+                        env = "staging"
+                    elif branch == (project.prod_branch or DEFAULT_PROD_BRANCH):
+                        env = "prod"
+                    if env:
+                        restart_env(project.slug, env)
+                        record_build_event(
+                            project.id,
+                            env,
+                            branch,
+                            sha,
+                            "deployed",
+                            f"Restarted {env} on push to {branch}",
+                        )
+        return {"ok": True}
+
+    return {"ok": True}
 
 
 @app.post("/projects")
@@ -677,6 +915,31 @@ def project_settings(request: Request, project_id: int):
         if not project:
             return HTMLResponse("Not found", status_code=404)
         db.refresh(project)
+        if user.is_admin:
+            installations = db.query(Installation).order_by(Installation.installed_at.desc()).all()
+        else:
+            installations = (
+                db.query(Installation)
+                .filter(Installation.account_login == user.username)
+                .order_by(Installation.installed_at.desc())
+                .all()
+            )
+        install_ids = [i.installation_id for i in installations]
+        repos = []
+        if install_ids:
+            repos = (
+                db.query(Repository)
+                .filter(Repository.installation_id.in_(install_ids))
+                .order_by(Repository.full_name.asc())
+                .all()
+            )
+        builds = (
+            db.query(BuildEvent)
+            .filter(BuildEvent.project_id == project.id)
+            .order_by(BuildEvent.created_at.desc())
+            .limit(10)
+            .all()
+        )
         return templates.TemplateResponse(
             "project_settings.html",
             {
@@ -684,6 +947,10 @@ def project_settings(request: Request, project_id: int):
                 "user": user,
                 "project": project,
                 "base_domain": BASE_DOMAIN,
+                "installations": installations,
+                "repos": repos,
+                "builds": builds,
+                "github_install_url": github_install_url(),
             },
         )
 
@@ -726,6 +993,60 @@ def update_project_settings(
         # Reconcile environments with new settings.
         for env in list(project.envs):
             provision_env(project, env.name)
+
+    return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
+
+
+@app.post("/projects/{project_id}/repo")
+def connect_repo(
+    request: Request,
+    project_id: int,
+    repo_full_name: str = Form(...),
+    installation_id: str = Form(""),
+):
+    user = current_user(request)
+    if not user:
+        return RedirectResponse("/login")
+
+    repo_full_name = repo_full_name.strip()
+    if not repo_full_name or "/" not in repo_full_name:
+        return HTMLResponse("Invalid repository name", status_code=400)
+
+    with db_session() as db:
+        project = get_project_for_user(db, user, project_id)
+        if not project:
+            return HTMLResponse("Not found", status_code=404)
+
+        if not installation_id:
+            # Auto-select if exactly one installation matches this user.
+            q = db.query(Installation)
+            if not user.is_admin:
+                q = q.filter(Installation.account_login == user.username)
+            installs = q.all()
+            if len(installs) == 1:
+                installation_id = installs[0].installation_id
+
+        if not installation_id:
+            return HTMLResponse("Installation ID required", status_code=400)
+
+        # Verify access via GitHub App installation token.
+        try:
+            token = github_installation_token(installation_id)
+            headers = {
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            }
+            resp = httpx.get(f"https://api.github.com/repos/{repo_full_name}", headers=headers, timeout=20)
+            resp.raise_for_status()
+            repo = resp.json()
+        except Exception:
+            return HTMLResponse("Unable to access repository with this installation", status_code=400)
+
+        project.repo_full_name = repo_full_name
+        project.repo_id = str(repo.get("id"))
+        project.installation_id = str(installation_id)
+        db.commit()
 
     return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
 
