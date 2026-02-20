@@ -7,6 +7,7 @@ from typing import Optional
 import psycopg2
 from psycopg2 import sql
 from authlib.integrations.starlette_client import OAuth
+from authlib.integrations.base_client.errors import MismatchingStateError
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
@@ -71,7 +72,8 @@ class Environment(Base):
 Base.metadata.create_all(engine)
 
 app = FastAPI()
-app.add_middleware(SessionMiddleware, secret_key=APP_SECRET, https_only=False)
+# OAuth state is stored in the session cookie; require HTTPS and use lax SameSite.
+app.add_middleware(SessionMiddleware, secret_key=APP_SECRET, https_only=True, same_site="lax")
 
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
 
@@ -388,7 +390,11 @@ async def auth_github(request: Request):
 
 @app.get("/auth/github/callback")
 async def auth_callback(request: Request):
-    token = await oauth.github.authorize_access_token(request)
+    try:
+        token = await oauth.github.authorize_access_token(request)
+    except MismatchingStateError:
+        request.session.clear()
+        return RedirectResponse("/login")
     resp = await oauth.github.get("user", token=token)
     profile = resp.json()
 
