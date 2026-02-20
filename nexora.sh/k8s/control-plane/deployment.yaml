@@ -1,0 +1,97 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nexora-control-plane
+  namespace: nexora-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nexora-control-plane
+  template:
+    metadata:
+      labels:
+        app: nexora-control-plane
+    spec:
+      serviceAccountName: nexora-control-plane
+      containers:
+        - name: control-plane
+          image: ghcr.io/abdelrahmanesawy/nexora-control-plane:latest
+          imagePullPolicy: Always
+          command: ["uvicorn"]
+          args:
+            [
+              "app.main:app",
+              "--host",
+              "0.0.0.0",
+              "--port",
+              "8000",
+              "--proxy-headers",
+              "--forwarded-allow-ips",
+              "*",
+            ]
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: BASE_DOMAIN
+              value: nexora.red
+            - name: ADMIN_GITHUB
+              value: AbdelrahmanEsawy
+            - name: ODOO_NAMESPACE
+              value: odoo-system
+            - name: ODOO_IMAGE
+              value: odoo:17
+            - name: DATA_DIR
+              value: /data
+            - name: APP_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-control-plane
+                  key: APP_SECRET
+            - name: ODOO_ADMIN_PASSWD
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-control-plane
+                  key: ODOO_ADMIN_PASSWD
+            - name: GITHUB_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-github
+                  key: GITHUB_CLIENT_ID
+            - name: GITHUB_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-github
+                  key: GITHUB_CLIENT_SECRET
+            - name: DB_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-db
+                  key: host
+            - name: DB_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-db
+                  key: port
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-db
+                  key: user
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-db
+                  key: password
+            - name: DB_SSLMODE
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-db
+                  key: sslmode
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
