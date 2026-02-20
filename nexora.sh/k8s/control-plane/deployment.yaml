@@ -41,7 +41,7 @@ spec:
             - name: ODOO_NAMESPACE
               value: odoo-system
             - name: ODOO_IMAGE
-              value: odoo:17
+              value: odoo:19
             - name: DATA_DIR
               value: /data
             - name: APP_SECRET
@@ -94,4 +94,5 @@ spec:
               mountPath: /data
       volumes:
         - name: data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: nexora-control-plane-data
