@@ -3,6 +3,7 @@ import hmac
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import time
 from datetime import datetime
@@ -14,7 +15,7 @@ import psycopg2
 from psycopg2 import sql
 from authlib.integrations.starlette_client import OAuth
 from authlib.integrations.base_client.errors import MismatchingStateError
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, Form, Request, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, create_engine, text
@@ -226,6 +227,22 @@ def ensure_schema():
 ensure_schema()
 
 app = FastAPI()
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/ready")
+def ready():
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=1)
+        conn.execute("SELECT 1")
+        conn.close()
+    except Exception:
+        raise HTTPException(status_code=503, detail="storage unavailable")
+    return {"status": "ready"}
 # OAuth state is stored in the session cookie; require HTTPS and use lax SameSite.
 app.add_middleware(SessionMiddleware, secret_key=APP_SECRET, https_only=True, same_site="lax")
 

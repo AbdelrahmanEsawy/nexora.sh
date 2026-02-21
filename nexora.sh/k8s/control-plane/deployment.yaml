@@ -18,8 +18,8 @@ spec:
         - name: ghcr-credentials
       containers:
         - name: control-plane
-          image: ghcr.io/abdelrahmanesawy/nexora-control-plane:latest
-          imagePullPolicy: Always
+          image: ghcr.io/abdelrahmanesawy/nexora-control-plane@sha256:18621859a29dce3195a8f6fc7ea5fbd62aa5d7c53079703a509fbdc5b8a532e0
+          imagePullPolicy: IfNotPresent
           command: ["uvicorn"]
           args:
             [
@@ -35,6 +35,29 @@ spec:
           ports:
             - containerPort: 8000
               name: http
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            timeoutSeconds: 2
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 20
+            timeoutSeconds: 2
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
           env:
             - name: BASE_DOMAIN
               value: nexora.red
