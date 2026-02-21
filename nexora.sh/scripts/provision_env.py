@@ -46,6 +46,11 @@ def main():
     ap.add_argument("--namespace", default="odoo-system", help="Kubernetes namespace")
     ap.add_argument("--db-name", default=None, help="Database name override")
     ap.add_argument("--admin-passwd", default=None, help="Odoo master password (admin_passwd)")
+    ap.add_argument(
+        "--storage-class",
+        default=os.environ.get("STORAGE_CLASS_NAME", "csi-cinder-high-speed"),
+        help="StorageClassName for PVCs (empty to use cluster default)",
+    )
     ap.add_argument("--kubeconfig", default=os.environ.get("KUBECONFIG", "/tmp/nexora-kubeconfig"))
     ap.add_argument("--dry-run", action="store_true", help="Print manifest only")
     args = ap.parse_args()
@@ -74,6 +79,7 @@ def main():
     name = f"odoo-{project}-{env}"
     pvc_name = f"odoo-filestore-{project}-{env}"
     cfg_secret = f"odoo-config-{project}-{env}"
+    storage_class_line = f"  storageClassName: {args.storage_class}\n" if args.storage_class else ""
 
     manifest = dedent(f"""
     apiVersion: v1
@@ -102,7 +108,7 @@ def main():
     spec:
       accessModes:
         - ReadWriteOnce
-      resources:
+    {storage_class_line}  resources:
         requests:
           storage: 10Gi
     ---

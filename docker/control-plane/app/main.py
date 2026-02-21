@@ -46,6 +46,7 @@ DEFAULT_WORKERS = int(os.getenv("DEFAULT_WORKERS", "1"))
 DEFAULT_STORAGE_GB = int(os.getenv("DEFAULT_STORAGE_GB", "1"))
 DEFAULT_STAGING_SLOTS = int(os.getenv("DEFAULT_STAGING_SLOTS", "1"))
 DEFAULT_ODOO_VERSION = os.getenv("DEFAULT_ODOO_VERSION", "19.0")
+STORAGE_CLASS_NAME = os.getenv("STORAGE_CLASS_NAME", "csi-cinder-high-speed")
 
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 DB_PATH = os.path.join(DATA_DIR, "nexora.db")
@@ -571,6 +572,7 @@ def provision_env(project: Project, env: str):
     workers = project.workers or DEFAULT_WORKERS
     odoo_image = odoo_image_for(project)
     tls_secret = f"{name}-tls"
+    storage_class_line = f"  storageClassName: {STORAGE_CLASS_NAME}\n" if STORAGE_CLASS_NAME else ""
 
     create_db(db_name)
 
@@ -603,7 +605,7 @@ metadata:
 spec:
   accessModes:
     - ReadWriteOnce
-  resources:
+{storage_class_line}  resources:
     requests:
       storage: {storage_gb}Gi
 ---
@@ -746,6 +748,10 @@ def promote_env(project: Project, source_env: str, target_env: str):
     clone_db(source_db, target_db)
     copy_filestore(source_pvc, target_pvc)
     restart_env(project.slug, target_env)
+
+
+def reset_from_prod(project: Project, target_env: str):
+    promote_env(project, "prod", target_env)
 
 
 def delete_env(slug: str, env: str):
@@ -1263,6 +1269,40 @@ def reset_project_env(
 
         reset_env(project, env)
         record_build_event(project.id, env, "", "", "reset", "Dev reset")
+
+    return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
+
+
+@app.post("/projects/{project_id}/reset-from-prod")
+def reset_project_env_from_prod(
+    request: Request,
+    project_id: int,
+    target_env: str = Form(...),
+):
+    user = current_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    if target_env not in {"dev", "staging"}:
+        return HTMLResponse("Only dev or staging can be reset from prod", status_code=400)
+
+    with db_session() as db:
+        project = get_project_for_user(db, user, project_id)
+        if not project:
+            return HTMLResponse("Not found", status_code=404)
+
+        envs = {e.name: e for e in project.envs}
+        if "prod" not in envs:
+            return HTMLResponse("Production environment missing", status_code=400)
+
+        if target_env not in envs:
+            host, db_name = provision_env(project, target_env)
+            env_obj = Environment(project_id=project.id, name=target_env, host=host, db_name=db_name)
+            db.add(env_obj)
+            db.commit()
+            db.refresh(env_obj)
+
+        reset_from_prod(project, target_env)
+        record_build_event(project.id, target_env, "", "", "reset", f"Reset {target_env} from prod")
 
     return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
 

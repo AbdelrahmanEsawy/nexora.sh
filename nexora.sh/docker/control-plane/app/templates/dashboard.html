@@ -4,7 +4,7 @@
   <div class="row" style="justify-content: space-between;">
     <div>
       <div class="project-title">Create a Project</div>
-      <div class="muted" style="font-size:12px;">This will auto-provision dev, staging, and prod environments.</div>
+      <div class="muted" style="font-size:12px;">This will provision the dev environment (Odoo 19 Community). Promote to staging and prod when ready.</div>
     </div>
     <form method="post" action="/projects" style="display:flex; gap:8px; align-items:center;">
       <input class="input" type="text" name="display_name" placeholder="Project name (display)" required>
@@ -30,12 +30,21 @@
       </div>
     </div>
     <div class="spacer"></div>
-    {% for env in project.envs %}
+    {% for env_name in ["prod","staging","dev"] %}
+      {% set env = (project.envs | selectattr("name","equalto", env_name) | list | first) %}
       <div class="row" style="justify-content: space-between; margin-bottom:6px;">
-        <span class="env-pill">{{ env.name }}</span>
-        <a class="btn" href="https://{{ env.host }}" target="_blank">Open</a>
+        <span class="env-pill">{{ env_name }}</span>
+        {% if env %}
+          <a class="btn" href="https://{{ env.host }}" target="_blank">Open</a>
+        {% else %}
+          <a class="btn ghost" href="/projects/{{ project.id }}/settings">Create</a>
+        {% endif %}
       </div>
-      <div class="muted" style="font-size:12px;">{{ env.host }}</div>
+      {% if env %}
+        <div class="muted" style="font-size:12px;">{{ env.host }}</div>
+      {% else %}
+        <div class="muted" style="font-size:12px;">Not created yet</div>
+      {% endif %}
       <div class="spacer"></div>
     {% endfor %}
   </div>

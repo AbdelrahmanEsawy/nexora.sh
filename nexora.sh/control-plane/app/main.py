@@ -25,6 +25,7 @@ DB_PORT = os.getenv("DB_PORT", "5432")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_SSLMODE = os.getenv("DB_SSLMODE", "require")
+STORAGE_CLASS_NAME = os.getenv("STORAGE_CLASS_NAME", "csi-cinder-high-speed")
 
 APP_SECRET = os.getenv("APP_SECRET", "change-me")
 
@@ -178,6 +179,7 @@ def provision_env(slug: str, env: str):
     name = f"odoo-{slug}-{env}"
     pvc_name = f"odoo-filestore-{slug}-{env}"
     cfg_secret = f"odoo-config-{slug}-{env}"
+    storage_class_line = f"  storageClassName: {STORAGE_CLASS_NAME}\n" if STORAGE_CLASS_NAME else ""
 
     create_db(db_name)
 
@@ -208,7 +210,7 @@ metadata:
 spec:
   accessModes:
     - ReadWriteOnce
-  resources:
+{storage_class_line}  resources:
     requests:
       storage: 10Gi
 ---

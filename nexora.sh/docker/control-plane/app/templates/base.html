@@ -110,6 +110,18 @@
       font-size: 12px;
       border: 1px solid rgba(34,211,238,0.25);
     }
+    .env-card {
+      border: 1px dashed transparent;
+      transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
+    }
+    .env-card.dragging {
+      opacity: 0.7;
+      transform: scale(0.99);
+    }
+    .env-card.drop-target {
+      border-color: rgba(34,211,238,0.65);
+      box-shadow: 0 0 0 2px rgba(34,211,238,0.2) inset;
+    }
     .project-title { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
     .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
     .spacer { height: 18px; }

@@ -67,7 +67,7 @@
       <input class="input" name="subscription_code" value="{{ project.subscription_code or '' }}" />
     </div>
     <div>
-      <div class="muted" style="font-size:12px; margin-bottom:6px;">Odoo version</div>
+      <div class="muted" style="font-size:12px; margin-bottom:6px;">Odoo version (community)</div>
       <input class="input" name="odoo_version" value="{{ project.odoo_version or '19.0' }}" />
     </div>
   </div>
@@ -141,13 +141,20 @@
 <div class="card">
   <div class="project-title">Environments & Domains</div>
   <div class="muted" style="font-size:12px; margin-bottom:12px;">
-    Use the base subdomain or attach custom domains per environment. Ensure DNS A records point to your ingress IP.
+    Order is Prod → Staging → Dev. Drag to promote or reset from production. Pushes to the dev branch reset dev automatically.
   </div>
 
-  {% set env_names = project.envs | map(attribute='name') | list %}
+  {% set prod_env = (project.envs | selectattr("name","equalto","prod") | list | first) %}
   {% for env_name in ["prod","staging","dev"] %}
     {% set env = (project.envs | selectattr("name","equalto", env_name) | list | first) %}
-    <div class="card" style="margin-bottom:12px; background: #0b1220;">
+    <div
+      class="card env-card"
+      data-env="{{ env_name }}"
+      data-project="{{ project.id }}"
+      data-env-exists="{{ 1 if env else 0 }}"
+      draggable="{{ 'true' if env else 'false' }}"
+      style="margin-bottom:12px; background: #0b1220;"
+    >
       <div class="row" style="justify-content: space-between;">
         <div class="row">
           <span class="env-pill">{{ env_name }}</span>
@@ -165,25 +172,33 @@
             <form method="post" action="/projects/{{ project.id }}/promote">
               <input type="hidden" name="source_env" value="{{ "dev" if env_name == "staging" else "staging" }}" />
               <input type="hidden" name="target_env" value="{{ env_name }}" />
-              <button class="btn ghost" type="submit">Promote</button>
+              <button class="btn ghost" type="submit">
+                {{ "Promote from Dev" if env_name == "staging" else "Promote from Staging" }}
+              </button>
             </form>
           {% elif env_name == "staging" and not env %}
             <form method="post" action="/projects/{{ project.id }}/promote">
               <input type="hidden" name="source_env" value="dev" />
               <input type="hidden" name="target_env" value="staging" />
-              <button class="btn ghost" type="submit">Create</button>
+              <button class="btn ghost" type="submit">Create from Dev</button>
             </form>
           {% elif env_name == "prod" and not env %}
             <form method="post" action="/projects/{{ project.id }}/promote">
               <input type="hidden" name="source_env" value="staging" />
               <input type="hidden" name="target_env" value="prod" />
-              <button class="btn ghost" type="submit">Create</button>
+              <button class="btn ghost" type="submit">Create from Staging</button>
             </form>
           {% endif %}
           {% if env_name == "dev" and env %}
             <form method="post" action="/projects/{{ project.id }}/reset">
               <input type="hidden" name="env" value="dev" />
-              <button class="btn ghost danger" type="submit">Reset Dev</button>
+              <button class="btn ghost danger" type="submit">Reset Dev (empty)</button>
+            </form>
+          {% endif %}
+          {% if env_name in ["dev","staging"] and prod_env %}
+            <form method="post" action="/projects/{{ project.id }}/reset-from-prod">
+              <input type="hidden" name="target_env" value="{{ env_name }}" />
+              <button class="btn ghost" type="submit">Reset from Prod</button>
             </form>
           {% endif %}
         </div>
@@ -213,4 +228,94 @@
     </div>
   {% endfor %}
 </div>
+
+<script>
+  (function () {
+    const cards = document.querySelectorAll(".env-card");
+    let dragged = null;
+
+    function clearTargets() {
+      cards.forEach((card) => card.classList.remove("drop-target"));
+    }
+
+    async function postAction(url, data) {
+      const body = new URLSearchParams(data);
+      const res = await fetch(url, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body,
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        alert(text || "Action failed");
+        return;
+      }
+      window.location.reload();
+    }
+
+    function handleDrop(sourceEnv, targetEnv, projectId) {
+      if (!sourceEnv || !targetEnv || sourceEnv === targetEnv) {
+        return;
+      }
+      const promoteUrl = `/projects/${projectId}/promote`;
+      const resetUrl = `/projects/${projectId}/reset-from-prod`;
+      if (sourceEnv === "dev" && targetEnv === "staging") {
+        if (confirm("Promote Dev → Staging?")) {
+          postAction(promoteUrl, { source_env: "dev", target_env: "staging" });
+        }
+        return;
+      }
+      if (sourceEnv === "staging" && targetEnv === "prod") {
+        if (confirm("Promote Staging → Prod?")) {
+          postAction(promoteUrl, { source_env: "staging", target_env: "prod" });
+        }
+        return;
+      }
+      if (sourceEnv === "prod" && (targetEnv === "staging" || targetEnv === "dev")) {
+        if (confirm(`Reset ${targetEnv} from Prod? This overwrites its database and filestore.`)) {
+          postAction(resetUrl, { target_env: targetEnv });
+        }
+        return;
+      }
+      alert("Allowed: dev → staging, staging → prod, prod → staging/dev (reset from prod).");
+    }
+
+    cards.forEach((card) => {
+      const env = card.dataset.env;
+      const projectId = card.dataset.project;
+      const exists = card.dataset.envExists === "1";
+
+      if (exists) {
+        card.setAttribute("draggable", "true");
+        card.addEventListener("dragstart", (e) => {
+          dragged = env;
+          card.classList.add("dragging");
+          e.dataTransfer.setData("text/plain", env);
+          e.dataTransfer.effectAllowed = "move";
+        });
+        card.addEventListener("dragend", () => {
+          dragged = null;
+          card.classList.remove("dragging");
+          clearTargets();
+        });
+      }
+
+      card.addEventListener("dragover", (e) => {
+        if (!dragged) return;
+        e.preventDefault();
+        card.classList.add("drop-target");
+      });
+
+      card.addEventListener("dragleave", () => card.classList.remove("drop-target"));
+
+      card.addEventListener("drop", (e) => {
+        e.preventDefault();
+        const sourceEnv = dragged || e.dataTransfer.getData("text/plain");
+        clearTargets();
+        handleDrop(sourceEnv, env, projectId);
+      });
+    });
+  })();
+</script>
 {% endblock %}
