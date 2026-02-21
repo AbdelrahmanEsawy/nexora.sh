@@ -145,6 +145,8 @@
   </div>
 
   {% set prod_env = (project.envs | selectattr("name","equalto","prod") | list | first) %}
+  {% set staging_env = (project.envs | selectattr("name","equalto","staging") | list | first) %}
+  {% set dev_env = (project.envs | selectattr("name","equalto","dev") | list | first) %}
   {% for env_name in ["prod","staging","dev"] %}
     {% set env = (project.envs | selectattr("name","equalto", env_name) | list | first) %}
     <div
@@ -177,16 +179,30 @@
               </button>
             </form>
           {% elif env_name == "staging" and not env %}
-            <form method="post" action="/projects/{{ project.id }}/promote">
-              <input type="hidden" name="source_env" value="dev" />
-              <input type="hidden" name="target_env" value="staging" />
-              <button class="btn ghost" type="submit">Create from Dev</button>
-            </form>
+            {% if dev_env %}
+              <form method="post" action="/projects/{{ project.id }}/promote">
+                <input type="hidden" name="source_env" value="dev" />
+                <input type="hidden" name="target_env" value="staging" />
+                <button class="btn ghost" type="submit">Create from Dev</button>
+              </form>
+            {% else %}
+              <span class="muted" style="font-size:12px;">Create dev first</span>
+            {% endif %}
           {% elif env_name == "prod" and not env %}
-            <form method="post" action="/projects/{{ project.id }}/promote">
-              <input type="hidden" name="source_env" value="staging" />
-              <input type="hidden" name="target_env" value="prod" />
-              <button class="btn ghost" type="submit">Create from Staging</button>
+            {% if staging_env %}
+              <form method="post" action="/projects/{{ project.id }}/promote">
+                <input type="hidden" name="source_env" value="staging" />
+                <input type="hidden" name="target_env" value="prod" />
+                <button class="btn ghost" type="submit">Create from Staging</button>
+              </form>
+            {% else %}
+              <span class="muted" style="font-size:12px;">Create staging first</span>
+            {% endif %}
+          {% endif %}
+          {% if env_name == "dev" and not env %}
+            <form method="post" action="/projects/{{ project.id }}/envs/create">
+              <input type="hidden" name="env" value="dev" />
+              <button class="btn ghost" type="submit">Create Dev</button>
             </form>
           {% endif %}
           {% if env_name == "dev" and env %}

@@ -6,6 +6,7 @@ import subprocess
 import time
 from datetime import datetime
 from typing import Optional
+from urllib.parse import urlencode
 
 import httpx
 import psycopg2
@@ -221,6 +222,13 @@ if GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET:
 
 
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,30}$")
+
+
+def redirect_with_error(path: str, message: str, extra: Optional[dict] = None):
+    params = {"error": message}
+    if extra:
+        params.update(extra)
+    return RedirectResponse(f"{path}?{urlencode(params)}", status_code=303)
 
 
 def github_app_enabled() -> bool:
@@ -787,6 +795,10 @@ def index(request: Request):
     if not user:
         return RedirectResponse("/login")
 
+    error = request.query_params.get("error")
+    prefill_slug = request.query_params.get("slug", "")
+    prefill_display = request.query_params.get("display_name", "")
+
     with db_session() as db:
         if user.is_admin:
             projects = db.query(Project).all()
@@ -802,6 +814,9 @@ def index(request: Request):
                 "user": user,
                 "projects": projects,
                 "base_domain": BASE_DOMAIN,
+                "error": error,
+                "prefill_slug": prefill_slug,
+                "prefill_display": prefill_display,
             },
         )
 
@@ -949,19 +964,28 @@ def create_project(request: Request, slug: str = Form(...), display_name: str = 
 
     ensure_prereqs()
 
-    slug = slug.strip().lower()
-    slug = re.sub(r"[^a-z0-9-]", "-", slug)
+    raw_slug = (slug or "").strip().lower()
+    raw_display = (display_name or "").strip()
+    slug = re.sub(r"[^a-z0-9-]", "-", raw_slug)
     slug = re.sub(r"-+", "-", slug).strip("-")
 
     if not SLUG_RE.match(slug):
-        return HTMLResponse("Invalid project slug", status_code=400)
+        return redirect_with_error(
+            "/",
+            "Slug must be 2–31 chars, lowercase letters/numbers, and hyphens only.",
+            {"slug": slug, "display_name": raw_display},
+        )
 
     with db_session() as db:
         if db.query(Project).filter(Project.slug == slug).first():
-            return HTMLResponse("Project already exists", status_code=400)
+            return redirect_with_error(
+                "/",
+                "Project already exists.",
+                {"slug": slug, "display_name": raw_display},
+            )
         project = Project(
             slug=slug,
-            display_name=(display_name or slug).strip()[:80],
+            display_name=(raw_display or slug).strip()[:80],
             dev_branch=DEFAULT_DEV_BRANCH,
             staging_branch=DEFAULT_STAGING_BRANCH,
             prod_branch=DEFAULT_PROD_BRANCH,
@@ -1020,6 +1044,7 @@ def project_settings(request: Request, project_id: int):
     user = current_user(request)
     if not user:
         return RedirectResponse("/login")
+    error = request.query_params.get("error")
     with db_session() as db:
         project = get_project_for_user(db, user, project_id)
         if not project:
@@ -1063,6 +1088,7 @@ def project_settings(request: Request, project_id: int):
                 "repos": repos,
                 "builds": builds,
                 "github_install_url": github_install_url(),
+                "error": error,
             },
         )
 
@@ -1211,13 +1237,16 @@ def promote_project_env(
         return RedirectResponse("/login")
 
     if source_env not in {"dev", "staging", "prod"} or target_env not in {"dev", "staging", "prod"}:
-        return HTMLResponse("Invalid environment", status_code=400)
+        return redirect_with_error(f"/projects/{project_id}/settings", "Invalid environment.")
     if source_env == target_env:
-        return HTMLResponse("Invalid promotion", status_code=400)
+        return redirect_with_error(f"/projects/{project_id}/settings", "Invalid promotion.")
 
     allowed = {("dev", "staging"), ("staging", "prod")}
     if (source_env, target_env) not in allowed:
-        return HTMLResponse("Promotion order must be dev → staging → prod", status_code=400)
+        return redirect_with_error(
+            f"/projects/{project_id}/settings",
+            "Promotion order must be dev → staging → prod.",
+        )
 
     with db_session() as db:
         project = get_project_for_user(db, user, project_id)
@@ -1226,7 +1255,10 @@ def promote_project_env(
 
         envs = {e.name: e for e in project.envs}
         if source_env not in envs:
-            return HTMLResponse("Source environment missing", status_code=400)
+            return redirect_with_error(
+                f"/projects/{project_id}/settings",
+                f"Source environment '{source_env}' is missing. Create it first.",
+            )
 
         if target_env not in envs:
             host, db_name = provision_env(project, target_env)
@@ -1260,7 +1292,7 @@ def reset_project_env(
     if not user:
         return RedirectResponse("/login")
     if env not in {"dev"}:
-        return HTMLResponse("Only dev can be reset", status_code=400)
+        return redirect_with_error(f"/projects/{project_id}/settings", "Only dev can be reset.")
 
     with db_session() as db:
         project = get_project_for_user(db, user, project_id)
@@ -1283,7 +1315,10 @@ def reset_project_env_from_prod(
     if not user:
         return RedirectResponse("/login")
     if target_env not in {"dev", "staging"}:
-        return HTMLResponse("Only dev or staging can be reset from prod", status_code=400)
+        return redirect_with_error(
+            f"/projects/{project_id}/settings",
+            "Only dev or staging can be reset from prod.",
+        )
 
     with db_session() as db:
         project = get_project_for_user(db, user, project_id)
@@ -1292,7 +1327,10 @@ def reset_project_env_from_prod(
 
         envs = {e.name: e for e in project.envs}
         if "prod" not in envs:
-            return HTMLResponse("Production environment missing", status_code=400)
+            return redirect_with_error(
+                f"/projects/{project_id}/settings",
+                "Production environment missing. Create prod first.",
+            )
 
         if target_env not in envs:
             host, db_name = provision_env(project, target_env)
@@ -1303,6 +1341,41 @@ def reset_project_env_from_prod(
 
         reset_from_prod(project, target_env)
         record_build_event(project.id, target_env, "", "", "reset", f"Reset {target_env} from prod")
+
+    return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
+
+
+@app.post("/projects/{project_id}/envs/create")
+def create_env_manual(
+    request: Request,
+    project_id: int,
+    env: str = Form(...),
+):
+    user = current_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    if env not in {"dev"}:
+        return redirect_with_error(
+            f"/projects/{project_id}/settings",
+            "Only dev can be created manually.",
+        )
+
+    with db_session() as db:
+        project = get_project_for_user(db, user, project_id)
+        if not project:
+            return HTMLResponse("Not found", status_code=404)
+
+        envs = {e.name: e for e in project.envs}
+        if env in envs:
+            return redirect_with_error(
+                f"/projects/{project_id}/settings",
+                f"{env} environment already exists.",
+            )
+
+        host, db_name = provision_env(project, env)
+        env_obj = Environment(project_id=project.id, name=env, host=host, db_name=db_name)
+        db.add(env_obj)
+        db.commit()
 
     return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
 

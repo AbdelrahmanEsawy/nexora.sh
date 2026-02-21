@@ -6,10 +6,11 @@
       <div class="project-title">Create a Project</div>
       <div class="muted" style="font-size:12px;">This will provision the dev environment (Odoo 19 Community). Promote to staging and prod when ready.</div>
     </div>
-    <form method="post" action="/projects" style="display:flex; gap:8px; align-items:center;">
-      <input class="input" type="text" name="display_name" placeholder="Project name (display)" required>
-      <input class="input" type="text" name="slug" placeholder="project-slug" required>
+    <form method="post" action="/projects" style="display:flex; gap:8px; align-items:center; flex-wrap: wrap;">
+      <input class="input" type="text" name="display_name" placeholder="Project name (display)" value="{{ prefill_display or '' }}" required>
+      <input class="input" type="text" name="slug" placeholder="project-slug" value="{{ prefill_slug or '' }}" pattern="[a-z0-9][a-z0-9-]{1,30}" title="2–31 chars, lowercase letters/numbers, hyphens only" required>
       <button class="btn primary" type="submit">Create</button>
+      <div class="muted" style="font-size:12px;">Slug: 2–31 chars, lowercase letters/numbers, hyphens only.</div>
     </form>
   </div>
 </div>
