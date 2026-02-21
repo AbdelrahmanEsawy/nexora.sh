@@ -685,6 +685,10 @@ kind: Secret
 metadata:
   name: {cfg_secret}
   namespace: {ODOO_NAMESPACE}
+  labels:
+    app: odoo
+    project: {slug}
+    env: {env}
 type: Opaque
 stringData:
   odoo.conf: |
@@ -705,6 +709,10 @@ kind: PersistentVolumeClaim
 metadata:
   name: {pvc_name}
   namespace: {ODOO_NAMESPACE}
+  labels:
+    app: odoo
+    project: {slug}
+    env: {env}
 spec:
   accessModes:
     - ReadWriteOnce
