@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 import os
 import re
 import subprocess
@@ -97,6 +98,9 @@ class Environment(Base):
     name = Column(String, nullable=False)
     host = Column(String, nullable=False)
     db_name = Column(String, nullable=False)
+    workers = Column(Integer, nullable=True)
+    storage_gb = Column(Integer, nullable=True)
+    odoo_version = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     project = relationship("Project", back_populates="envs")
     domains = relationship("Domain", back_populates="environment", cascade="all, delete-orphan")
@@ -193,6 +197,28 @@ def ensure_schema():
         )
         conn.execute(
             text("UPDATE projects SET odoo_version = :v WHERE odoo_version IS NULL"),
+            {"v": DEFAULT_ODOO_VERSION},
+        )
+
+        env_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(environments)"))}
+        for name, ddl in [
+            ("workers", "workers INTEGER"),
+            ("storage_gb", "storage_gb INTEGER"),
+            ("odoo_version", "odoo_version TEXT"),
+        ]:
+            if name not in env_cols:
+                conn.execute(text(f"ALTER TABLE environments ADD COLUMN {ddl}"))
+
+        conn.execute(
+            text("UPDATE environments SET workers = :v WHERE workers IS NULL"),
+            {"v": DEFAULT_WORKERS},
+        )
+        conn.execute(
+            text("UPDATE environments SET storage_gb = :v WHERE storage_gb IS NULL"),
+            {"v": DEFAULT_STORAGE_GB},
+        )
+        conn.execute(
+            text("UPDATE environments SET odoo_version = :v WHERE odoo_version IS NULL"),
             {"v": DEFAULT_ODOO_VERSION},
         )
 
@@ -368,11 +394,29 @@ def db_name_for(slug: str, env: str) -> str:
     return f"{slug}_{env}"
 
 
-def odoo_image_for(project: Project) -> str:
-    version = project.odoo_version or DEFAULT_ODOO_VERSION
+def odoo_image_for_version(version: str) -> str:
+    version = version or DEFAULT_ODOO_VERSION
     if version.startswith("odoo:"):
         return version
     return f"odoo:{version}"
+
+
+def effective_env_settings(project: Project, env_obj: Optional["Environment"] = None) -> dict:
+    workers = project.workers or DEFAULT_WORKERS
+    storage_gb = project.storage_gb or DEFAULT_STORAGE_GB
+    odoo_version = project.odoo_version or DEFAULT_ODOO_VERSION
+    if env_obj:
+        if env_obj.workers:
+            workers = env_obj.workers
+        if env_obj.storage_gb:
+            storage_gb = env_obj.storage_gb
+        if env_obj.odoo_version:
+            odoo_version = env_obj.odoo_version
+    return {
+        "workers": max(1, int(workers)),
+        "storage_gb": max(1, int(storage_gb)),
+        "odoo_version": odoo_version,
+    }
 
 
 def ingress_name_for_domain(base: str, host: str) -> str:
@@ -465,6 +509,39 @@ def kubectl_apply(manifest: str):
     )
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.decode("utf-8"))
+
+
+def kubectl_get_json(namespace: str, kind: str, name: str) -> Optional[dict]:
+    proc = subprocess.run(
+        ["kubectl", "-n", namespace, "get", kind, name, "-o", "json"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if proc.returncode != 0:
+        return None
+    try:
+        return json.loads(proc.stdout.decode("utf-8"))
+    except Exception:
+        return None
+
+
+def env_runtime_status(project: Project, env_name: str) -> dict:
+    name = f"odoo-{project.slug}-{env_name}"
+    deploy = kubectl_get_json(ODOO_NAMESPACE, "deployment", name)
+    if not deploy:
+        return {"ready": False, "message": "Not created yet"}
+    status = deploy.get("status", {})
+    replicas = int(status.get("replicas") or 0)
+    ready = int(status.get("readyReplicas") or 0)
+    if replicas and ready >= replicas:
+        return {"ready": True, "message": "Ready"}
+    pvc_name = f"odoo-filestore-{project.slug}-{env_name}"
+    pvc = kubectl_get_json(ODOO_NAMESPACE, "pvc", pvc_name)
+    if pvc:
+        phase = pvc.get("status", {}).get("phase")
+        if phase == "Pending":
+            return {"ready": False, "message": "Storage pending"}
+    return {"ready": False, "message": "Starting"}
 
 
 def kubectl_delete(kind: str, name: str):
@@ -569,16 +646,17 @@ spec:
     kubectl_apply(manifest)
 
 
-def provision_env(project: Project, env: str):
+def provision_env(project: Project, env: str, env_obj: Optional[Environment] = None):
     slug = project.slug
     host = host_for(slug, env)
     db_name = db_name_for(slug, env)
     name = f"odoo-{slug}-{env}"
     pvc_name = f"odoo-filestore-{slug}-{env}"
     cfg_secret = f"odoo-config-{slug}-{env}"
-    storage_gb = project.storage_gb or DEFAULT_STORAGE_GB
-    workers = project.workers or DEFAULT_WORKERS
-    odoo_image = odoo_image_for(project)
+    settings = effective_env_settings(project, env_obj)
+    storage_gb = settings["storage_gb"]
+    workers = settings["workers"]
+    odoo_image = odoo_image_for_version(settings["odoo_version"])
     tls_secret = f"{name}-tls"
     storage_class_line = f"  storageClassName: {STORAGE_CLASS_NAME}\n" if STORAGE_CLASS_NAME else ""
 
@@ -1002,7 +1080,17 @@ def create_project(request: Request, slug: str = Form(...), display_name: str = 
 
         # Create only dev by default (Odoo.sh-like: dev first).
         host, db_name = provision_env(project, "dev")
-        db.add(Environment(project_id=project.id, name="dev", host=host, db_name=db_name))
+        db.add(
+            Environment(
+                project_id=project.id,
+                name="dev",
+                host=host,
+                db_name=db_name,
+                workers=project.workers or DEFAULT_WORKERS,
+                storage_gb=project.storage_gb or DEFAULT_STORAGE_GB,
+                odoo_version=project.odoo_version or DEFAULT_ODOO_VERSION,
+            )
+        )
         db.commit()
 
     return RedirectResponse("/", status_code=302)
@@ -1077,6 +1165,9 @@ def project_settings(request: Request, project_id: int):
             .limit(10)
             .all()
         )
+        env_status = {}
+        for env in project.envs:
+            env_status[env.name] = env_runtime_status(project, env.name)
         return templates.TemplateResponse(
             "project_settings.html",
             {
@@ -1089,6 +1180,7 @@ def project_settings(request: Request, project_id: int):
                 "builds": builds,
                 "github_install_url": github_install_url(),
                 "error": error,
+                "env_status": env_status,
             },
         )
 
@@ -1130,7 +1222,48 @@ def update_project_settings(
 
         # Reconcile existing environments with new settings.
         for env in list(project.envs):
-            provision_env(project, env.name)
+            provision_env(project, env.name, env)
+
+    return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
+
+
+@app.post("/projects/{project_id}/envs/{env_id}/settings")
+def update_env_settings(
+    request: Request,
+    project_id: int,
+    env_id: int,
+    workers: int = Form(...),
+    storage_gb: int = Form(...),
+    odoo_version: str = Form(DEFAULT_ODOO_VERSION),
+):
+    user = current_user(request)
+    if not user:
+        return RedirectResponse("/login")
+
+    with db_session() as db:
+        project = get_project_for_user(db, user, project_id)
+        if not project:
+            return HTMLResponse("Not found", status_code=404)
+        env = db.query(Environment).filter(Environment.id == env_id).first()
+        if not env or env.project_id != project.id:
+            return redirect_with_error(f"/projects/{project_id}/settings", "Invalid environment.")
+
+        new_workers = max(1, int(workers))
+        new_storage = max(1, int(storage_gb))
+        current_storage = env.storage_gb or project.storage_gb or DEFAULT_STORAGE_GB
+        if new_storage < current_storage:
+            return redirect_with_error(
+                f"/projects/{project_id}/settings",
+                "Filestore size cannot be decreased.",
+            )
+
+        env.workers = new_workers
+        env.storage_gb = new_storage
+        env.odoo_version = (odoo_version.strip() or DEFAULT_ODOO_VERSION)
+        db.commit()
+        db.refresh(env)
+
+        provision_env(project, env.name, env)
 
     return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
 
@@ -1261,8 +1394,22 @@ def promote_project_env(
             )
 
         if target_env not in envs:
-            host, db_name = provision_env(project, target_env)
-            env_obj = Environment(project_id=project.id, name=target_env, host=host, db_name=db_name)
+            source_settings = effective_env_settings(project, envs[source_env])
+            temp_env = Environment(
+                workers=source_settings["workers"],
+                storage_gb=source_settings["storage_gb"],
+                odoo_version=source_settings["odoo_version"],
+            )
+            host, db_name = provision_env(project, target_env, temp_env)
+            env_obj = Environment(
+                project_id=project.id,
+                name=target_env,
+                host=host,
+                db_name=db_name,
+                workers=source_settings["workers"],
+                storage_gb=source_settings["storage_gb"],
+                odoo_version=source_settings["odoo_version"],
+            )
             db.add(env_obj)
             db.commit()
             db.refresh(env_obj)
@@ -1333,8 +1480,22 @@ def reset_project_env_from_prod(
             )
 
         if target_env not in envs:
-            host, db_name = provision_env(project, target_env)
-            env_obj = Environment(project_id=project.id, name=target_env, host=host, db_name=db_name)
+            prod_settings = effective_env_settings(project, envs["prod"])
+            temp_env = Environment(
+                workers=prod_settings["workers"],
+                storage_gb=prod_settings["storage_gb"],
+                odoo_version=prod_settings["odoo_version"],
+            )
+            host, db_name = provision_env(project, target_env, temp_env)
+            env_obj = Environment(
+                project_id=project.id,
+                name=target_env,
+                host=host,
+                db_name=db_name,
+                workers=prod_settings["workers"],
+                storage_gb=prod_settings["storage_gb"],
+                odoo_version=prod_settings["odoo_version"],
+            )
             db.add(env_obj)
             db.commit()
             db.refresh(env_obj)
