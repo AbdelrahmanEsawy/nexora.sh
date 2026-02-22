@@ -590,8 +590,9 @@ def env_runtime_status(project: Project, env_name: str) -> dict:
             Environment.name == env_name,
         ).first()
 
-    if env_obj and env_obj.last_error:
-        return {"ready": False, "message": f"Error: {env_obj.last_error}"}
+    env_error = ""
+    if env_obj and env_obj.status == "failed" and env_obj.last_error:
+        env_error = env_obj.last_error
 
     name = f"odoo-{project.slug}-{env_name}"
     deploy = kubectl_get_json(ODOO_NAMESPACE, "deployment", name)
@@ -599,6 +600,8 @@ def env_runtime_status(project: Project, env_name: str) -> dict:
         if env_obj and env_obj.status == "provisioning":
             return {"ready": False, "message": "Provisioning resources"}
         if env_obj and env_obj.status == "failed":
+            if env_error:
+                return {"ready": False, "message": f"Error: {env_error}"}
             return {"ready": False, "message": "Provisioning failed"}
         return {"ready": False, "message": "Not created yet"}
     status = deploy.get("status", {})
@@ -1375,6 +1378,10 @@ def project_settings(request: Request, project_id: int):
             if env.name == "dev":
                 try:
                     ensure_odoo_init(project, env.name, env)
+                    if env.status == "failed" or env.last_error:
+                        env.status = "active"
+                        env.last_error = ""
+                        db.commit()
                 except Exception as exc:
                     env.status = "failed"
                     env.last_error = str(exc)[:500]
@@ -1418,6 +1425,10 @@ def project_env_status(request: Request, project_id: int, env_name: str):
         if env_name == "dev":
             try:
                 ensure_odoo_init(project, env_name, env)
+                if env.status == "failed" or env.last_error:
+                    env.status = "active"
+                    env.last_error = ""
+                    db.commit()
             except Exception as exc:
                 set_env_status(project.id, env_name, "failed", str(exc))
 
@@ -1452,6 +1463,10 @@ def project_env_open(request: Request, project_id: int, env_name: str):
         if env_name == "dev":
             try:
                 ensure_odoo_init(project, env_name, env)
+                if env.status == "failed" or env.last_error:
+                    env.status = "active"
+                    env.last_error = ""
+                    db.commit()
             except Exception as exc:
                 set_env_status(project.id, env_name, "failed", str(exc))
 
