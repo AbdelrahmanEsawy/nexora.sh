@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <div class="project-title">{{ project.display_name or project.slug }} · {{ env_name }}</div>
+  <div class="muted" style="font-size:12px; margin-bottom:12px;">
+    We’re preparing your environment. This can take a few minutes on first boot.
+  </div>
+  <div class="row" style="align-items: center; gap: 16px;">
+    <div class="spinner"></div>
+    <div>
+      <div id="status-text" style="font-weight:600;">{{ status.message or "Starting" }}</div>
+      <div class="muted" style="font-size:12px;">We’ll redirect you once it’s ready.</div>
+    </div>
+  </div>
+  <div class="spacer"></div>
+  <div class="row">
+    <a class="btn ghost" href="/projects/{{ project.id }}/settings">Back</a>
+    <a class="btn" href="https://{{ env.host }}" target="_blank">Open anyway</a>
+  </div>
+</div>
+
+<script>
+  (function () {
+    const statusEl = document.getElementById("status-text");
+    async function poll() {
+      try {
+        const res = await fetch(`/projects/{{ project.id }}/env/{{ env_name }}/status`, {
+          credentials: "same-origin",
+        });
+        if (res.ok) {
+          const data = await res.json();
+          statusEl.textContent = data.message || "Starting";
+          if (data.ready) {
+            window.location.href = `https://{{ env.host }}`;
+            return;
+          }
+        }
+      } catch (e) {}
+      setTimeout(poll, 4000);
+    }
+    setTimeout(poll, 1500);
+  })();
+</script>
+{% endblock %}

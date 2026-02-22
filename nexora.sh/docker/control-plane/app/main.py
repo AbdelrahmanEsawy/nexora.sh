@@ -16,7 +16,7 @@ from psycopg2 import sql
 from authlib.integrations.starlette_client import OAuth
 from authlib.integrations.base_client.errors import MismatchingStateError
 from fastapi import FastAPI, Form, Request, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, create_engine, text
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
@@ -445,6 +445,37 @@ def ingress_name_for_domain(base: str, host: str) -> str:
     return name[:63].rstrip("-")
 
 
+def env_service_url(slug: str, env: str) -> str:
+    return f"http://odoo-{slug}-{env}.{ODOO_NAMESPACE}.svc.cluster.local"
+
+
+def odoo_http_status(slug: str, env: str) -> Optional[int]:
+    url = f"{env_service_url(slug, env)}/web/login"
+    try:
+        with httpx.Client(timeout=2.0) as client:
+            resp = client.get(url, follow_redirects=False)
+        return resp.status_code
+    except Exception:
+        return None
+
+
+def init_job_name(slug: str, env: str) -> str:
+    name = f"odoo-init-{slug}-{env}"
+    return name[:63].rstrip("-")
+
+
+def init_job_status(slug: str, env: str) -> Optional[dict]:
+    job = kubectl_get_json(ODOO_NAMESPACE, "job", init_job_name(slug, env))
+    if not job:
+        return None
+    status = job.get("status", {})
+    return {
+        "active": int(status.get("active") or 0),
+        "succeeded": int(status.get("succeeded") or 0),
+        "failed": int(status.get("failed") or 0),
+    }
+
+
 def create_db(db_name: str):
     conn = psycopg2.connect(
         host=DB_HOST,
@@ -551,7 +582,18 @@ def env_runtime_status(project: Project, env_name: str) -> dict:
     replicas = int(status.get("replicas") or 0)
     ready = int(status.get("readyReplicas") or 0)
     if replicas and ready >= replicas:
-        return {"ready": True, "message": "Ready"}
+        job_status = init_job_status(project.slug, env_name)
+        if job_status:
+            if job_status.get("failed", 0) > 0:
+                return {"ready": False, "message": "Init failed"}
+            if job_status.get("active", 0) > 0:
+                return {"ready": False, "message": "Initializing database"}
+        http_code = odoo_http_status(project.slug, env_name)
+        if http_code and 200 <= http_code < 400:
+            return {"ready": True, "message": "Ready"}
+        if http_code and http_code >= 500:
+            return {"ready": False, "message": "Starting Odoo"}
+        return {"ready": False, "message": "Starting"}
     pvc_name = f"odoo-filestore-{project.slug}-{env_name}"
     pvc = kubectl_get_json(ODOO_NAMESPACE, "pvc", pvc_name)
     if pvc:
@@ -611,6 +653,64 @@ spec:
     kubectl_apply(manifest)
     kubectl_wait("job", name)
     kubectl_delete("job", name)
+
+
+def ensure_odoo_init(project: Project, env: str, env_obj: Optional[Environment] = None):
+    slug = project.slug
+    job_name = init_job_name(slug, env)
+    status = init_job_status(slug, env)
+    if status:
+        if status.get("succeeded", 0) > 0 or status.get("active", 0) > 0:
+            return
+        if status.get("failed", 0) > 0:
+            kubectl_delete("job", job_name)
+
+    settings = effective_env_settings(project, env_obj)
+    odoo_image = odoo_image_for_version(settings["odoo_version"])
+    pvc_name = f"odoo-filestore-{slug}-{env}"
+    cfg_secret = f"odoo-config-{slug}-{env}"
+
+    manifest = f"""
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {job_name}
+  namespace: {ODOO_NAMESPACE}
+  labels:
+    app: odoo
+    project: {slug}
+    env: {env}
+    role: init
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: init
+          image: {odoo_image}
+          command:
+            [
+              "sh",
+              "-c",
+              "odoo -c /etc/odoo/odoo.conf -i base --stop-after-init --log-level=info",
+            ]
+          volumeMounts:
+            - name: filestore
+              mountPath: /var/lib/odoo
+            - name: odoo-config
+              mountPath: /etc/odoo/odoo.conf
+              subPath: odoo.conf
+      volumes:
+        - name: filestore
+          persistentVolumeClaim:
+            claimName: {pvc_name}
+        - name: odoo-config
+          secret:
+            secretName: {cfg_secret}
+""".strip() + "\n"
+
+    kubectl_apply(manifest)
 
 
 def wipe_filestore(pvc_name: str):
@@ -838,6 +938,7 @@ spec:
 """.strip() + "\n"
 
     kubectl_apply(manifest)
+    ensure_odoo_init(project, env, env_obj)
     return host, db_name
 
 
@@ -848,6 +949,7 @@ def reset_env(project: Project, env: str):
     create_db(db_name)
     wipe_filestore(pvc_name)
     restart_env(project.slug, env)
+    ensure_odoo_init(project, env)
 
 
 def promote_env(project: Project, source_env: str, target_env: str):
@@ -1192,6 +1294,8 @@ def project_settings(request: Request, project_id: int):
         )
         env_status = {}
         for env in project.envs:
+            if env.name == "dev":
+                ensure_odoo_init(project, env.name, env)
             env_status[env.name] = env_runtime_status(project, env.name)
         return templates.TemplateResponse(
             "project_settings.html",
@@ -1206,6 +1310,75 @@ def project_settings(request: Request, project_id: int):
                 "github_install_url": github_install_url(),
                 "error": error,
                 "env_status": env_status,
+            },
+        )
+
+
+@app.get("/projects/{project_id}/env/{env_name}/status")
+def project_env_status(request: Request, project_id: int, env_name: str):
+    user = current_user(request)
+    if not user:
+        return JSONResponse({"ready": False, "message": "Unauthorized"}, status_code=401)
+    if env_name not in {"dev", "staging", "prod"}:
+        return JSONResponse({"ready": False, "message": "Invalid environment"}, status_code=400)
+
+    with db_session() as db:
+        project = get_project_for_user(db, user, project_id)
+        if not project:
+            return JSONResponse({"ready": False, "message": "Not found"}, status_code=404)
+        env = db.query(Environment).filter(
+            Environment.project_id == project.id, Environment.name == env_name
+        ).first()
+        if not env:
+            return JSONResponse({"ready": False, "message": "Not created yet"}, status_code=404)
+
+        if env_name == "dev":
+            ensure_odoo_init(project, env_name, env)
+
+        status = env_runtime_status(project, env_name)
+        return JSONResponse(
+            {
+                "ready": bool(status.get("ready")),
+                "message": status.get("message") or "",
+                "host": env.host,
+            }
+        )
+
+
+@app.get("/projects/{project_id}/env/{env_name}/open", response_class=HTMLResponse)
+def project_env_open(request: Request, project_id: int, env_name: str):
+    user = current_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    if env_name not in {"dev", "staging", "prod"}:
+        return HTMLResponse("Invalid environment", status_code=400)
+
+    with db_session() as db:
+        project = get_project_for_user(db, user, project_id)
+        if not project:
+            return HTMLResponse("Not found", status_code=404)
+        env = db.query(Environment).filter(
+            Environment.project_id == project.id, Environment.name == env_name
+        ).first()
+        if not env:
+            return HTMLResponse("Environment not created yet", status_code=404)
+
+        if env_name == "dev":
+            ensure_odoo_init(project, env_name, env)
+
+        status = env_runtime_status(project, env_name)
+        if status.get("ready"):
+            return RedirectResponse(f"https://{env.host}")
+
+        return templates.TemplateResponse(
+            "env_loading.html",
+            {
+                "request": request,
+                "user": user,
+                "project": project,
+                "env": env,
+                "env_name": env_name,
+                "status": status,
             },
         )
 

@@ -141,7 +141,7 @@
 <div class="card" style="margin-bottom:16px;">
   <div class="project-title">Environments & Domains</div>
   <div class="muted" style="font-size:12px; margin-bottom:12px;">
-    Order is Dev → Staging → Prod. Drag to promote or reset from production. Pushes to the dev branch reset dev automatically.
+    Order is Dev → Staging → Prod. Drag to promote. Dragging Staging/Prod to Dev resets Dev to empty. Pushes to the dev branch reset dev automatically.
   </div>
 </div>
 
@@ -187,10 +187,10 @@
             {% endif %}
           </div>
           <div class="row">
-            {% if env and status and status.ready %}
-              <a class="btn" href="https://{{ env.host }}" target="_blank">Open</a>
-            {% elif env %}
-              <span class="btn disabled">Not ready</span>
+            {% if env %}
+              <a class="btn" href="/projects/{{ project.id }}/env/{{ env_name }}/open">
+                {{ "Open" if status and status.ready else "Open (loading)" }}
+              </a>
             {% endif %}
             {% if env_name != "dev" and env %}
               <form method="post" action="/projects/{{ project.id }}/promote">
@@ -201,12 +201,18 @@
                 </button>
               </form>
             {% elif env_name == "staging" and not env %}
-              {% if dev_env %}
-                <form method="post" action="/projects/{{ project.id }}/promote">
-                  <input type="hidden" name="source_env" value="dev" />
-                  <input type="hidden" name="target_env" value="staging" />
-                  <button class="btn ghost" type="submit">Create from Dev</button>
-                </form>
+              {% if dev_env or prod_env %}
+                <div class="row">
+                  <select class="input" id="staging-source-{{ project.id }}">
+                    {% if dev_env %}
+                      <option value="dev">Copy from Dev</option>
+                    {% endif %}
+                    {% if prod_env %}
+                      <option value="prod">Copy from Prod</option>
+                    {% endif %}
+                  </select>
+                  <button class="btn ghost" type="button" onclick="createStaging({{ project.id }})">+ Create</button>
+                </div>
               {% else %}
                 <span class="muted" style="font-size:12px;">Create dev first</span>
               {% endif %}
@@ -233,7 +239,7 @@
                 <button class="btn ghost danger" type="submit">Reset Dev (empty)</button>
               </form>
             {% endif %}
-            {% if env_name in ["dev","staging"] and prod_env %}
+            {% if env_name == "staging" and prod_env %}
               <form method="post" action="/projects/{{ project.id }}/reset-from-prod">
                 <input type="hidden" name="target_env" value="{{ env_name }}" />
                 <button class="btn ghost" type="submit">Reset from Prod</button>
@@ -320,12 +326,28 @@
       window.location.reload();
     }
 
+    window.createStaging = function (projectId) {
+      const select = document.getElementById(`staging-source-${projectId}`);
+      if (!select) return;
+      const source = select.value;
+      if (source === "prod") {
+        if (confirm("Create Staging from Prod? This copies production data.")) {
+          postAction(`/projects/${projectId}/reset-from-prod`, { target_env: "staging" });
+        }
+        return;
+      }
+      if (confirm("Create Staging from Dev?")) {
+        postAction(`/projects/${projectId}/promote`, { source_env: "dev", target_env: "staging" });
+      }
+    };
+
     function handleDrop(sourceEnv, targetEnv, projectId) {
       if (!sourceEnv || !targetEnv || sourceEnv === targetEnv) {
         return;
       }
       const promoteUrl = `/projects/${projectId}/promote`;
       const resetUrl = `/projects/${projectId}/reset-from-prod`;
+      const resetDevUrl = `/projects/${projectId}/reset`;
       if (sourceEnv === "dev" && targetEnv === "staging") {
         if (confirm("Promote Dev → Staging?")) {
           postAction(promoteUrl, { source_env: "dev", target_env: "staging" });
@@ -338,13 +360,19 @@
         }
         return;
       }
-      if (sourceEnv === "prod" && (targetEnv === "staging" || targetEnv === "dev")) {
-        if (confirm(`Reset ${targetEnv} from Prod? This overwrites its database and filestore.`)) {
-          postAction(resetUrl, { target_env: targetEnv });
+      if (targetEnv === "dev" && (sourceEnv === "prod" || sourceEnv === "staging")) {
+        if (confirm("Reset Dev to empty? This wipes the dev database and filestore.")) {
+          postAction(resetDevUrl, { env: "dev" });
         }
         return;
       }
-      alert("Allowed: dev → staging, staging → prod, prod → staging/dev (reset from prod).");
+      if (sourceEnv === "prod" && targetEnv === "staging") {
+        if (confirm("Reset Staging from Prod? This overwrites its database and filestore.")) {
+          postAction(resetUrl, { target_env: "staging" });
+        }
+        return;
+      }
+      alert("Allowed: dev → staging, staging → prod, prod → staging (copy), staging/prod → dev (reset empty).");
     }
 
     cards.forEach((card) => {

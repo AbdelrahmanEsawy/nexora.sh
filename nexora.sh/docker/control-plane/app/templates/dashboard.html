@@ -36,7 +36,7 @@
       <div class="row" style="justify-content: space-between; margin-bottom:6px;">
         <span class="env-pill">{{ env_name }}</span>
         {% if env %}
-          <a class="btn" href="https://{{ env.host }}" target="_blank">Open</a>
+          <a class="btn" href="/projects/{{ project.id }}/env/{{ env_name }}/open">Open</a>
         {% else %}
           <a class="btn ghost" href="/projects/{{ project.id }}/settings">Create</a>
         {% endif %}
