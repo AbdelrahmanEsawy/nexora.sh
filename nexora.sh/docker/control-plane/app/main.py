@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import threading
 import time
 from datetime import datetime
 from typing import Optional
@@ -102,6 +103,8 @@ class Environment(Base):
     workers = Column(Integer, nullable=True)
     storage_gb = Column(Integer, nullable=True)
     odoo_version = Column(String, nullable=True)
+    status = Column(String, nullable=True)
+    last_error = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     project = relationship("Project", back_populates="envs")
     domains = relationship("Domain", back_populates="environment", cascade="all, delete-orphan")
@@ -206,6 +209,8 @@ def ensure_schema():
             ("workers", "workers INTEGER"),
             ("storage_gb", "storage_gb INTEGER"),
             ("odoo_version", "odoo_version TEXT"),
+            ("status", "status TEXT"),
+            ("last_error", "last_error TEXT"),
         ]:
             if name not in env_cols:
                 conn.execute(text(f"ALTER TABLE environments ADD COLUMN {ddl}"))
@@ -221,6 +226,10 @@ def ensure_schema():
         conn.execute(
             text("UPDATE environments SET odoo_version = :v WHERE odoo_version IS NULL"),
             {"v": DEFAULT_ODOO_VERSION},
+        )
+        conn.execute(
+            text("UPDATE environments SET status = :v WHERE status IS NULL"),
+            {"v": "active"},
         )
 
 
@@ -574,9 +583,23 @@ def kubectl_get_json(namespace: str, kind: str, name: str) -> Optional[dict]:
 
 
 def env_runtime_status(project: Project, env_name: str) -> dict:
+    env_obj = None
+    with db_session() as db:
+        env_obj = db.query(Environment).filter(
+            Environment.project_id == project.id,
+            Environment.name == env_name,
+        ).first()
+
+    if env_obj and env_obj.last_error:
+        return {"ready": False, "message": f"Error: {env_obj.last_error}"}
+
     name = f"odoo-{project.slug}-{env_name}"
     deploy = kubectl_get_json(ODOO_NAMESPACE, "deployment", name)
     if not deploy:
+        if env_obj and env_obj.status == "provisioning":
+            return {"ready": False, "message": "Provisioning resources"}
+        if env_obj and env_obj.status == "failed":
+            return {"ready": False, "message": "Provisioning failed"}
         return {"ready": False, "message": "Not created yet"}
     status = deploy.get("status", {})
     replicas = int(status.get("replicas") or 0)
@@ -994,6 +1017,46 @@ def delete_env(slug: str, env: str):
     drop_db(db_name_for(slug, env))
 
 
+def set_env_status(project_id: int, env_name: str, status: str, error: str = ""):
+    with db_session() as db:
+        env = db.query(Environment).filter(
+            Environment.project_id == project_id,
+            Environment.name == env_name,
+        ).first()
+        if not env:
+            return
+        env.status = status
+        env.last_error = (error or "")[:500]
+        db.commit()
+
+
+def spawn_env_provision(project_id: int, env_name: str):
+    def _worker():
+        set_env_status(project_id, env_name, "provisioning", "")
+        try:
+            with db_session() as db:
+                project = db.query(Project).filter(Project.id == project_id).first()
+                if not project:
+                    return
+                env_obj = db.query(Environment).filter(
+                    Environment.project_id == project.id,
+                    Environment.name == env_name,
+                ).first()
+                if not env_obj:
+                    return
+                host, db_name = provision_env(project, env_name, env_obj)
+                env_obj.host = host
+                env_obj.db_name = db_name
+                env_obj.status = "active"
+                env_obj.last_error = ""
+                db.commit()
+        except Exception as exc:
+            set_env_status(project_id, env_name, "failed", str(exc))
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+
+
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
     user = current_user(request)
@@ -1024,6 +1087,11 @@ def index(request: Request):
                 "prefill_display": prefill_display,
             },
         )
+
+
+@app.get("/projects", response_class=HTMLResponse)
+def projects_index(request: Request):
+    return index(request)
 
 
 @app.get("/login", response_class=HTMLResponse)
@@ -1167,7 +1235,14 @@ def create_project(request: Request, slug: str = Form(...), display_name: str = 
     if not user:
         return RedirectResponse("/login")
 
-    ensure_prereqs()
+    try:
+        ensure_prereqs()
+    except RuntimeError as exc:
+        return redirect_with_error(
+            "/",
+            str(exc),
+            {"slug": (slug or "").strip(), "display_name": (display_name or "").strip()},
+        )
 
     raw_slug = (slug or "").strip().lower()
     raw_display = (display_name or "").strip()
@@ -1205,22 +1280,25 @@ def create_project(request: Request, slug: str = Form(...), display_name: str = 
         db.commit()
         db.refresh(project)
 
-        # Create only dev by default (Odoo.sh-like: dev first).
-        host, db_name = provision_env(project, "dev")
+        # Create dev record immediately, then provision in background.
         db.add(
             Environment(
                 project_id=project.id,
                 name="dev",
-                host=host,
-                db_name=db_name,
+                host=host_for(project.slug, "dev"),
+                db_name=db_name_for(project.slug, "dev"),
                 workers=project.workers or DEFAULT_WORKERS,
                 storage_gb=project.storage_gb or DEFAULT_STORAGE_GB,
                 odoo_version=project.odoo_version or DEFAULT_ODOO_VERSION,
+                status="provisioning",
+                last_error="",
             )
         )
         db.commit()
+        created_project_id = project.id
 
-    return RedirectResponse("/", status_code=302)
+    spawn_env_provision(created_project_id, "dev")
+    return RedirectResponse(f"/projects/{created_project_id}/settings#env-dev", status_code=303)
 
 
 @app.post("/projects/{project_id}/delete")
@@ -1295,7 +1373,12 @@ def project_settings(request: Request, project_id: int):
         env_status = {}
         for env in project.envs:
             if env.name == "dev":
-                ensure_odoo_init(project, env.name, env)
+                try:
+                    ensure_odoo_init(project, env.name, env)
+                except Exception as exc:
+                    env.status = "failed"
+                    env.last_error = str(exc)[:500]
+                    db.commit()
             env_status[env.name] = env_runtime_status(project, env.name)
         return templates.TemplateResponse(
             "project_settings.html",
@@ -1333,7 +1416,10 @@ def project_env_status(request: Request, project_id: int, env_name: str):
             return JSONResponse({"ready": False, "message": "Not created yet"}, status_code=404)
 
         if env_name == "dev":
-            ensure_odoo_init(project, env_name, env)
+            try:
+                ensure_odoo_init(project, env_name, env)
+            except Exception as exc:
+                set_env_status(project.id, env_name, "failed", str(exc))
 
         status = env_runtime_status(project, env_name)
         return JSONResponse(
@@ -1364,7 +1450,10 @@ def project_env_open(request: Request, project_id: int, env_name: str):
             return HTMLResponse("Environment not created yet", status_code=404)
 
         if env_name == "dev":
-            ensure_odoo_init(project, env_name, env)
+            try:
+                ensure_odoo_init(project, env_name, env)
+            except Exception as exc:
+                set_env_status(project.id, env_name, "failed", str(exc))
 
         status = env_runtime_status(project, env_name)
         if status.get("ready"):
@@ -1401,26 +1490,32 @@ def update_project_settings(
     if not user:
         return RedirectResponse("/login")
 
-    with db_session() as db:
-        project = get_project_for_user(db, user, project_id)
-        if not project:
-            return HTMLResponse("Not found", status_code=404)
+    try:
+        with db_session() as db:
+            project = get_project_for_user(db, user, project_id)
+            if not project:
+                return HTMLResponse("Not found", status_code=404)
 
-        project.display_name = display_name.strip()[:80] or project.slug
-        project.dev_branch = dev_branch.strip() or DEFAULT_DEV_BRANCH
-        project.staging_branch = staging_branch.strip() or DEFAULT_STAGING_BRANCH
-        project.prod_branch = prod_branch.strip() or DEFAULT_PROD_BRANCH
-        project.workers = max(1, int(workers))
-        project.storage_gb = max(1, int(storage_gb))
-        project.staging_slots = max(1, int(staging_slots))
-        project.subscription_code = subscription_code.strip()[:120]
-        project.odoo_version = (odoo_version.strip() or DEFAULT_ODOO_VERSION)
-        db.commit()
-        db.refresh(project)
+            project.display_name = display_name.strip()[:80] or project.slug
+            project.dev_branch = dev_branch.strip() or DEFAULT_DEV_BRANCH
+            project.staging_branch = staging_branch.strip() or DEFAULT_STAGING_BRANCH
+            project.prod_branch = prod_branch.strip() or DEFAULT_PROD_BRANCH
+            project.workers = max(1, int(workers))
+            project.storage_gb = max(1, int(storage_gb))
+            project.staging_slots = max(1, int(staging_slots))
+            project.subscription_code = subscription_code.strip()[:120]
+            project.odoo_version = (odoo_version.strip() or DEFAULT_ODOO_VERSION)
+            db.commit()
+            db.refresh(project)
 
-        # Reconcile existing environments with new settings.
-        for env in list(project.envs):
-            provision_env(project, env.name, env)
+            # Reconcile existing environments with new settings.
+            for env in list(project.envs):
+                provision_env(project, env.name, env)
+    except Exception as exc:
+        return redirect_with_error(
+            f"/projects/{project_id}/settings",
+            f"Saving project settings failed: {str(exc)[:200]}",
+        )
 
     return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
 
@@ -1438,30 +1533,39 @@ def update_env_settings(
     if not user:
         return RedirectResponse("/login")
 
-    with db_session() as db:
-        project = get_project_for_user(db, user, project_id)
-        if not project:
-            return HTMLResponse("Not found", status_code=404)
-        env = db.query(Environment).filter(Environment.id == env_id).first()
-        if not env or env.project_id != project.id:
-            return redirect_with_error(f"/projects/{project_id}/settings", "Invalid environment.")
+    try:
+        with db_session() as db:
+            project = get_project_for_user(db, user, project_id)
+            if not project:
+                return HTMLResponse("Not found", status_code=404)
+            env = db.query(Environment).filter(Environment.id == env_id).first()
+            if not env or env.project_id != project.id:
+                return redirect_with_error(f"/projects/{project_id}/settings", "Invalid environment.")
 
-        new_workers = max(1, int(workers))
-        new_storage = max(1, int(storage_gb))
-        current_storage = env.storage_gb or project.storage_gb or DEFAULT_STORAGE_GB
-        if new_storage < current_storage:
-            return redirect_with_error(
-                f"/projects/{project_id}/settings",
-                "Filestore size cannot be decreased.",
-            )
+            new_workers = max(1, int(workers))
+            new_storage = max(1, int(storage_gb))
+            current_storage = env.storage_gb or project.storage_gb or DEFAULT_STORAGE_GB
+            if new_storage < current_storage:
+                return redirect_with_error(
+                    f"/projects/{project_id}/settings",
+                    "Filestore size cannot be decreased.",
+                )
 
-        env.workers = new_workers
-        env.storage_gb = new_storage
-        env.odoo_version = (odoo_version.strip() or DEFAULT_ODOO_VERSION)
-        db.commit()
-        db.refresh(env)
+            env.workers = new_workers
+            env.storage_gb = new_storage
+            env.odoo_version = (odoo_version.strip() or DEFAULT_ODOO_VERSION)
+            db.commit()
+            db.refresh(env)
 
-        provision_env(project, env.name, env)
+            provision_env(project, env.name, env)
+            env.status = "active"
+            env.last_error = ""
+            db.commit()
+    except Exception as exc:
+        return redirect_with_error(
+            f"/projects/{project_id}/settings",
+            f"Saving environment settings failed: {str(exc)[:200]}",
+        )
 
     return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
 
@@ -1579,49 +1683,58 @@ def promote_project_env(
             "Promotion order must be dev → staging → prod.",
         )
 
-    with db_session() as db:
-        project = get_project_for_user(db, user, project_id)
-        if not project:
-            return HTMLResponse("Not found", status_code=404)
+    try:
+        with db_session() as db:
+            project = get_project_for_user(db, user, project_id)
+            if not project:
+                return HTMLResponse("Not found", status_code=404)
 
-        envs = {e.name: e for e in project.envs}
-        if source_env not in envs:
-            return redirect_with_error(
-                f"/projects/{project_id}/settings",
-                f"Source environment '{source_env}' is missing. Create it first.",
+            envs = {e.name: e for e in project.envs}
+            if source_env not in envs:
+                return redirect_with_error(
+                    f"/projects/{project_id}/settings",
+                    f"Source environment '{source_env}' is missing. Create it first.",
+                )
+
+            if target_env not in envs:
+                source_settings = effective_env_settings(project, envs[source_env])
+                temp_env = Environment(
+                    workers=source_settings["workers"],
+                    storage_gb=source_settings["storage_gb"],
+                    odoo_version=source_settings["odoo_version"],
+                )
+                host, db_name = provision_env(project, target_env, temp_env)
+                env_obj = Environment(
+                    project_id=project.id,
+                    name=target_env,
+                    host=host,
+                    db_name=db_name,
+                    workers=source_settings["workers"],
+                    storage_gb=source_settings["storage_gb"],
+                    odoo_version=source_settings["odoo_version"],
+                    status="active",
+                    last_error="",
+                )
+                db.add(env_obj)
+                db.commit()
+                db.refresh(env_obj)
+                envs[target_env] = env_obj
+
+            promote_env(project, source_env, target_env)
+            set_env_status(project.id, target_env, "active", "")
+
+            record_build_event(
+                project.id,
+                target_env,
+                "",
+                "",
+                "promoted",
+                f"Promoted {source_env} → {target_env}",
             )
-
-        if target_env not in envs:
-            source_settings = effective_env_settings(project, envs[source_env])
-            temp_env = Environment(
-                workers=source_settings["workers"],
-                storage_gb=source_settings["storage_gb"],
-                odoo_version=source_settings["odoo_version"],
-            )
-            host, db_name = provision_env(project, target_env, temp_env)
-            env_obj = Environment(
-                project_id=project.id,
-                name=target_env,
-                host=host,
-                db_name=db_name,
-                workers=source_settings["workers"],
-                storage_gb=source_settings["storage_gb"],
-                odoo_version=source_settings["odoo_version"],
-            )
-            db.add(env_obj)
-            db.commit()
-            db.refresh(env_obj)
-            envs[target_env] = env_obj
-
-        promote_env(project, source_env, target_env)
-
-        record_build_event(
-            project.id,
-            target_env,
-            "",
-            "",
-            "promoted",
-            f"Promoted {source_env} → {target_env}",
+    except Exception as exc:
+        return redirect_with_error(
+            f"/projects/{project_id}/settings",
+            f"Promotion failed: {str(exc)[:200]}",
         )
 
     return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
@@ -1639,13 +1752,20 @@ def reset_project_env(
     if env not in {"dev"}:
         return redirect_with_error(f"/projects/{project_id}/settings", "Only dev can be reset.")
 
-    with db_session() as db:
-        project = get_project_for_user(db, user, project_id)
-        if not project:
-            return HTMLResponse("Not found", status_code=404)
+    try:
+        with db_session() as db:
+            project = get_project_for_user(db, user, project_id)
+            if not project:
+                return HTMLResponse("Not found", status_code=404)
 
-        reset_env(project, env)
-        record_build_event(project.id, env, "", "", "reset", "Dev reset")
+            reset_env(project, env)
+            set_env_status(project.id, env, "active", "")
+            record_build_event(project.id, env, "", "", "reset", "Dev reset")
+    except Exception as exc:
+        return redirect_with_error(
+            f"/projects/{project_id}/settings",
+            f"Reset failed: {str(exc)[:200]}",
+        )
 
     return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
 
@@ -1665,41 +1785,50 @@ def reset_project_env_from_prod(
             "Only dev or staging can be reset from prod.",
         )
 
-    with db_session() as db:
-        project = get_project_for_user(db, user, project_id)
-        if not project:
-            return HTMLResponse("Not found", status_code=404)
+    try:
+        with db_session() as db:
+            project = get_project_for_user(db, user, project_id)
+            if not project:
+                return HTMLResponse("Not found", status_code=404)
 
-        envs = {e.name: e for e in project.envs}
-        if "prod" not in envs:
-            return redirect_with_error(
-                f"/projects/{project_id}/settings",
-                "Production environment missing. Create prod first.",
-            )
+            envs = {e.name: e for e in project.envs}
+            if "prod" not in envs:
+                return redirect_with_error(
+                    f"/projects/{project_id}/settings",
+                    "Production environment missing. Create prod first.",
+                )
 
-        if target_env not in envs:
-            prod_settings = effective_env_settings(project, envs["prod"])
-            temp_env = Environment(
-                workers=prod_settings["workers"],
-                storage_gb=prod_settings["storage_gb"],
-                odoo_version=prod_settings["odoo_version"],
-            )
-            host, db_name = provision_env(project, target_env, temp_env)
-            env_obj = Environment(
-                project_id=project.id,
-                name=target_env,
-                host=host,
-                db_name=db_name,
-                workers=prod_settings["workers"],
-                storage_gb=prod_settings["storage_gb"],
-                odoo_version=prod_settings["odoo_version"],
-            )
-            db.add(env_obj)
-            db.commit()
-            db.refresh(env_obj)
+            if target_env not in envs:
+                prod_settings = effective_env_settings(project, envs["prod"])
+                temp_env = Environment(
+                    workers=prod_settings["workers"],
+                    storage_gb=prod_settings["storage_gb"],
+                    odoo_version=prod_settings["odoo_version"],
+                )
+                host, db_name = provision_env(project, target_env, temp_env)
+                env_obj = Environment(
+                    project_id=project.id,
+                    name=target_env,
+                    host=host,
+                    db_name=db_name,
+                    workers=prod_settings["workers"],
+                    storage_gb=prod_settings["storage_gb"],
+                    odoo_version=prod_settings["odoo_version"],
+                    status="active",
+                    last_error="",
+                )
+                db.add(env_obj)
+                db.commit()
+                db.refresh(env_obj)
 
-        reset_from_prod(project, target_env)
-        record_build_event(project.id, target_env, "", "", "reset", f"Reset {target_env} from prod")
+            reset_from_prod(project, target_env)
+            set_env_status(project.id, target_env, "active", "")
+            record_build_event(project.id, target_env, "", "", "reset", f"Reset {target_env} from prod")
+    except Exception as exc:
+        return redirect_with_error(
+            f"/projects/{project_id}/settings",
+            f"Reset from prod failed: {str(exc)[:200]}",
+        )
 
     return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
 
@@ -1718,25 +1847,48 @@ def create_env_manual(
             f"/projects/{project_id}/settings",
             "Only dev can be created manually.",
         )
+    try:
+        ensure_prereqs()
+    except RuntimeError as exc:
+        return redirect_with_error(f"/projects/{project_id}/settings", str(exc))
 
     with db_session() as db:
         project = get_project_for_user(db, user, project_id)
         if not project:
             return HTMLResponse("Not found", status_code=404)
 
-        envs = {e.name: e for e in project.envs}
-        if env in envs:
+        env_obj = db.query(Environment).filter(
+            Environment.project_id == project.id,
+            Environment.name == env,
+        ).first()
+        if env_obj and env_obj.status == "provisioning":
+            return RedirectResponse(f"/projects/{project_id}/settings#env-{env}", status_code=303)
+        if env_obj and env_obj.status == "active":
             return redirect_with_error(
                 f"/projects/{project_id}/settings",
                 f"{env} environment already exists.",
             )
-
-        host, db_name = provision_env(project, env)
-        env_obj = Environment(project_id=project.id, name=env, host=host, db_name=db_name)
-        db.add(env_obj)
+        if not env_obj:
+            db.add(
+                Environment(
+                    project_id=project.id,
+                    name=env,
+                    host=host_for(project.slug, env),
+                    db_name=db_name_for(project.slug, env),
+                    workers=project.workers or DEFAULT_WORKERS,
+                    storage_gb=project.storage_gb or DEFAULT_STORAGE_GB,
+                    odoo_version=project.odoo_version or DEFAULT_ODOO_VERSION,
+                    status="provisioning",
+                    last_error="",
+                )
+            )
+        else:
+            env_obj.status = "provisioning"
+            env_obj.last_error = ""
         db.commit()
 
-    return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
+    spawn_env_provision(project_id, env)
+    return RedirectResponse(f"/projects/{project_id}/settings#env-{env}", status_code=303)
 
 
 @app.post("/projects/{project_id}/domains/{domain_id}/delete")
