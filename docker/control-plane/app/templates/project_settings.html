@@ -138,95 +138,161 @@
   {% endif %}
 </div>
 
-<div class="card">
+<div class="card" style="margin-bottom:16px;">
   <div class="project-title">Environments & Domains</div>
   <div class="muted" style="font-size:12px; margin-bottom:12px;">
-    Order is Prod → Staging → Dev. Drag to promote or reset from production. Pushes to the dev branch reset dev automatically.
+    Order is Dev → Staging → Prod. Drag to promote or reset from production. Pushes to the dev branch reset dev automatically.
+  </div>
+</div>
+
+<div class="grid" style="grid-template-columns: 220px 1fr; align-items: start;">
+  <div class="card" style="height: fit-content;">
+    <div class="project-title">Branches</div>
+    <div class="muted" style="font-size:12px; margin-bottom:12px;">Select an environment.</div>
+    {% for env_name in ["dev","staging","prod"] %}
+      {% set status = env_status.get(env_name) %}
+      <a class="btn ghost" href="#env-{{ env_name }}" style="width:100%; justify-content: space-between; margin-bottom:8px;">
+        <span class="env-pill">{{ env_name }}</span>
+        <span class="muted" style="font-size:11px;">
+          {{ status.message if status else "Not created" }}
+        </span>
+      </a>
+    {% endfor %}
   </div>
 
-  {% set prod_env = (project.envs | selectattr("name","equalto","prod") | list | first) %}
-  {% for env_name in ["prod","staging","dev"] %}
-    {% set env = (project.envs | selectattr("name","equalto", env_name) | list | first) %}
-    <div
-      class="card env-card"
-      data-env="{{ env_name }}"
-      data-project="{{ project.id }}"
-      data-env-exists="{{ 1 if env else 0 }}"
-      draggable="{{ 'true' if env else 'false' }}"
-      style="margin-bottom:12px; background: #0b1220;"
-    >
-      <div class="row" style="justify-content: space-between;">
-        <div class="row">
-          <span class="env-pill">{{ env_name }}</span>
-          {% if env %}
-            <span class="muted" style="font-size:12px;">{{ env.host }}</span>
-          {% else %}
-            <span class="muted" style="font-size:12px;">Not created yet</span>
-          {% endif %}
-        </div>
-        <div class="row">
-          {% if env %}
-            <a class="btn" href="https://{{ env.host }}" target="_blank">Open</a>
-          {% endif %}
-          {% if env_name != "dev" and env %}
-            <form method="post" action="/projects/{{ project.id }}/promote">
-              <input type="hidden" name="source_env" value="{{ "dev" if env_name == "staging" else "staging" }}" />
-              <input type="hidden" name="target_env" value="{{ env_name }}" />
-              <button class="btn ghost" type="submit">
-                {{ "Promote from Dev" if env_name == "staging" else "Promote from Staging" }}
-              </button>
-            </form>
-          {% elif env_name == "staging" and not env %}
-            <form method="post" action="/projects/{{ project.id }}/promote">
-              <input type="hidden" name="source_env" value="dev" />
-              <input type="hidden" name="target_env" value="staging" />
-              <button class="btn ghost" type="submit">Create from Dev</button>
-            </form>
-          {% elif env_name == "prod" and not env %}
-            <form method="post" action="/projects/{{ project.id }}/promote">
-              <input type="hidden" name="source_env" value="staging" />
-              <input type="hidden" name="target_env" value="prod" />
-              <button class="btn ghost" type="submit">Create from Staging</button>
-            </form>
-          {% endif %}
-          {% if env_name == "dev" and env %}
-            <form method="post" action="/projects/{{ project.id }}/reset">
-              <input type="hidden" name="env" value="dev" />
-              <button class="btn ghost danger" type="submit">Reset Dev (empty)</button>
-            </form>
-          {% endif %}
-          {% if env_name in ["dev","staging"] and prod_env %}
-            <form method="post" action="/projects/{{ project.id }}/reset-from-prod">
-              <input type="hidden" name="target_env" value="{{ env_name }}" />
-              <button class="btn ghost" type="submit">Reset from Prod</button>
-            </form>
-          {% endif %}
-        </div>
-      </div>
-      <div class="spacer"></div>
-      {% if env %}
-        <div class="muted" style="font-size:12px; margin-bottom:6px;">Custom domains</div>
-        {% if env.domains %}
-          {% for domain in env.domains %}
-            <div class="row" style="justify-content: space-between; margin-bottom:6px;">
-              <span>{{ domain.host }}</span>
-              <form method="post" action="/projects/{{ project.id }}/domains/{{ domain.id }}/delete">
-                <button class="btn ghost danger" type="submit">Remove</button>
+  <div>
+    {% set prod_env = (project.envs | selectattr("name","equalto","prod") | list | first) %}
+    {% set staging_env = (project.envs | selectattr("name","equalto","staging") | list | first) %}
+    {% set dev_env = (project.envs | selectattr("name","equalto","dev") | list | first) %}
+    {% for env_name in ["dev","staging","prod"] %}
+      {% set env = (project.envs | selectattr("name","equalto", env_name) | list | first) %}
+      {% set status = env_status.get(env_name) %}
+      <div
+        id="env-{{ env_name }}"
+        class="card env-card"
+        data-env="{{ env_name }}"
+        data-project="{{ project.id }}"
+        data-env-exists="{{ 1 if env else 0 }}"
+        draggable="{{ 'true' if env else 'false' }}"
+        style="margin-bottom:12px; background: #0b1220;"
+      >
+        <div class="row" style="justify-content: space-between;">
+          <div class="row">
+            <span class="env-pill">{{ env_name }}</span>
+            {% if env %}
+              <span class="muted" style="font-size:12px;">{{ env.host }}</span>
+              <span class="muted" style="font-size:12px;">· {{ status.message if status else "Unknown" }}</span>
+            {% else %}
+              <span class="muted" style="font-size:12px;">Not created yet</span>
+            {% endif %}
+          </div>
+          <div class="row">
+            {% if env and status and status.ready %}
+              <a class="btn" href="https://{{ env.host }}" target="_blank">Open</a>
+            {% elif env %}
+              <span class="btn disabled">Not ready</span>
+            {% endif %}
+            {% if env_name != "dev" and env %}
+              <form method="post" action="/projects/{{ project.id }}/promote">
+                <input type="hidden" name="source_env" value="{{ "dev" if env_name == "staging" else "staging" }}" />
+                <input type="hidden" name="target_env" value="{{ env_name }}" />
+                <button class="btn ghost" type="submit">
+                  {{ "Promote from Dev" if env_name == "staging" else "Promote from Staging" }}
+                </button>
               </form>
+            {% elif env_name == "staging" and not env %}
+              {% if dev_env %}
+                <form method="post" action="/projects/{{ project.id }}/promote">
+                  <input type="hidden" name="source_env" value="dev" />
+                  <input type="hidden" name="target_env" value="staging" />
+                  <button class="btn ghost" type="submit">Create from Dev</button>
+                </form>
+              {% else %}
+                <span class="muted" style="font-size:12px;">Create dev first</span>
+              {% endif %}
+            {% elif env_name == "prod" and not env %}
+              {% if staging_env %}
+                <form method="post" action="/projects/{{ project.id }}/promote">
+                  <input type="hidden" name="source_env" value="staging" />
+                  <input type="hidden" name="target_env" value="prod" />
+                  <button class="btn ghost" type="submit">Create from Staging</button>
+                </form>
+              {% else %}
+                <span class="muted" style="font-size:12px;">Create staging first</span>
+              {% endif %}
+            {% endif %}
+            {% if env_name == "dev" and not env %}
+              <form method="post" action="/projects/{{ project.id }}/envs/create">
+                <input type="hidden" name="env" value="dev" />
+                <button class="btn ghost" type="submit">Create Dev</button>
+              </form>
+            {% endif %}
+            {% if env_name == "dev" and env %}
+              <form method="post" action="/projects/{{ project.id }}/reset">
+                <input type="hidden" name="env" value="dev" />
+                <button class="btn ghost danger" type="submit">Reset Dev (empty)</button>
+              </form>
+            {% endif %}
+            {% if env_name in ["dev","staging"] and prod_env %}
+              <form method="post" action="/projects/{{ project.id }}/reset-from-prod">
+                <input type="hidden" name="target_env" value="{{ env_name }}" />
+                <button class="btn ghost" type="submit">Reset from Prod</button>
+              </form>
+            {% endif %}
+          </div>
+        </div>
+
+        {% if env %}
+          <div class="spacer"></div>
+          <div class="project-title" style="margin-bottom:10px;">Environment Configuration</div>
+          <div class="muted" style="font-size:12px; margin-bottom:10px;">
+            Overrides project defaults for this branch.
+          </div>
+          <form method="post" action="/projects/{{ project.id }}/envs/{{ env.id }}/settings">
+            <div class="grid">
+              <div>
+                <div class="muted" style="font-size:12px; margin-bottom:6px;">Database workers</div>
+                <input class="input" type="number" min="1" name="workers" value="{{ env.workers or project.workers or 1 }}" />
+              </div>
+              <div>
+                <div class="muted" style="font-size:12px; margin-bottom:6px;">Filestore size (Gi)</div>
+                <input class="input" type="number" min="1" name="storage_gb" value="{{ env.storage_gb or project.storage_gb or 1 }}" />
+              </div>
+              <div>
+                <div class="muted" style="font-size:12px; margin-bottom:6px;">Odoo version (community)</div>
+                <input class="input" name="odoo_version" value="{{ env.odoo_version or project.odoo_version or '19.0' }}" />
+              </div>
             </div>
-          {% endfor %}
-        {% else %}
-          <div class="muted" style="font-size:12px;">No custom domains yet.</div>
+            <div class="spacer"></div>
+            <div class="row" style="justify-content: flex-end;">
+              <button class="btn primary" type="submit">Save env settings</button>
+            </div>
+          </form>
+
+          <div class="spacer"></div>
+          <div class="muted" style="font-size:12px; margin-bottom:6px;">Custom domains</div>
+          {% if env.domains %}
+            {% for domain in env.domains %}
+              <div class="row" style="justify-content: space-between; margin-bottom:6px;">
+                <span>{{ domain.host }}</span>
+                <form method="post" action="/projects/{{ project.id }}/domains/{{ domain.id }}/delete">
+                  <button class="btn ghost danger" type="submit">Remove</button>
+                </form>
+              </div>
+            {% endfor %}
+          {% else %}
+            <div class="muted" style="font-size:12px;">No custom domains yet.</div>
+          {% endif %}
+          <div class="spacer"></div>
+          <form method="post" action="/projects/{{ project.id }}/domains" class="row">
+            <input type="hidden" name="env_id" value="{{ env.id }}" />
+            <input class="input" name="host" placeholder="custom.domain.com" required />
+            <button class="btn primary" type="submit">Add domain</button>
+          </form>
         {% endif %}
-        <div class="spacer"></div>
-        <form method="post" action="/projects/{{ project.id }}/domains" class="row">
-          <input type="hidden" name="env_id" value="{{ env.id }}" />
-          <input class="input" name="host" placeholder="custom.domain.com" required />
-          <button class="btn primary" type="submit">Add domain</button>
-        </form>
-      {% endif %}
-    </div>
-  {% endfor %}
+      </div>
+    {% endfor %}
+  </div>
 </div>
 
 <script>
