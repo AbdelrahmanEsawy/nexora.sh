@@ -1205,9 +1205,45 @@ def promote_env(project: Project, source_env: str, target_env: str):
     target_db = db_name_for(project.slug, target_env)
     source_pvc = f"odoo-filestore-{project.slug}-{source_env}"
     target_pvc = f"odoo-filestore-{project.slug}-{target_env}"
+    target_init_job = init_job_name(project.slug, target_env)
+    source_replicas = None
+    target_replicas = None
+    source_deploy = kubectl_get_json(ODOO_NAMESPACE, "deployment", f"odoo-{project.slug}-{source_env}")
+    if source_deploy:
+        source_replicas = int((source_deploy.get("spec", {}) or {}).get("replicas") or 0)
+    target_deploy = kubectl_get_json(ODOO_NAMESPACE, "deployment", f"odoo-{project.slug}-{target_env}")
+    if target_deploy:
+        target_replicas = int((target_deploy.get("spec", {}) or {}).get("replicas") or 0)
+
+    # RWO PVCs cannot be attached from multiple pods/nodes; scale down both envs before copy.
+    try:
+        scale_env(project.slug, source_env, 0)
+    except Exception:
+        pass
+    try:
+        scale_env(project.slug, target_env, 0)
+    except Exception:
+        pass
+
+    # If target was just provisioned, cancel its bootstrap job; this flow uses DB/PVC copy.
+    kubectl_delete("job", target_init_job)
+    run_kubectl(
+        ["delete", "pod", "-l", f"job-name={target_init_job}", "--ignore-not-found"],
+        namespace=ODOO_NAMESPACE,
+        timeout=KUBECTL_MUTATE_TIMEOUT,
+    )
 
     clone_db(source_db, target_db)
     copy_filestore(source_pvc, target_pvc)
+
+    if source_replicas and source_replicas > 0:
+        try:
+            scale_env(project.slug, source_env, source_replicas)
+        except Exception:
+            pass
+
+    desired_target = 1 if target_replicas is None else max(1, target_replicas)
+    scale_env(project.slug, target_env, desired_target)
     restart_env(project.slug, target_env)
 
 
