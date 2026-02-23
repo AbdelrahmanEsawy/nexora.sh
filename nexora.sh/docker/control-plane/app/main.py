@@ -882,7 +882,7 @@ spec:
             [
               "sh",
               "-c",
-              "odoo -c /etc/odoo/odoo.conf -i base --stop-after-init --log-level=info",
+              "odoo -c /etc/odoo/odoo.conf -i base --stop-after-init --workers=0 --max-cron-threads=0 --log-level=info",
             ]
           volumeMounts:
             - name: filestore
