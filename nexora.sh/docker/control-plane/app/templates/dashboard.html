@@ -1,23 +1,61 @@
 {% extends "base.html" %}
 {% block content %}
+<style>
+  @media (max-width: 920px) {
+    .create-project-grid {
+      grid-template-columns: 1fr !important;
+    }
+  }
+</style>
 <div class="card" id="new-project" style="margin-bottom:16px;">
   <div class="row" style="justify-content: space-between; margin-bottom:12px;">
     <div>
       <div class="project-title">Create a Project</div>
-      <div class="muted" style="font-size:12px;">Provisions Dev first, then promote to Staging and Production.</div>
+      <div class="muted" style="font-size:12px;">Provisions dev first. You can then promote to staging and production.</div>
     </div>
   </div>
-  <form method="post" action="/projects">
-    <div class="grid" style="grid-template-columns: 1.5fr 1fr auto; align-items: end;">
+  <form method="post" action="/projects" id="create-project-form">
+    <div class="grid create-project-grid" style="grid-template-columns: 1.3fr 1fr; align-items: end;">
       <div>
         <div class="muted" style="font-size:12px; margin-bottom:6px;">Display name</div>
-        <input class="input" type="text" name="display_name" placeholder="Project name (display)" value="{{ prefill_display or '' }}" required>
+        <input class="input" type="text" name="display_name" placeholder="Project name" value="{{ prefill_display or '' }}" required>
       </div>
       <div>
         <div class="muted" style="font-size:12px; margin-bottom:6px;">Slug</div>
         <input class="input" type="text" name="slug" placeholder="project-slug" value="{{ prefill_slug or '' }}" pattern="[a-z0-9][a-z0-9-]{1,30}" title="2–31 chars, lowercase letters/numbers, hyphens only" required>
       </div>
-      <button class="btn primary" type="submit" style="height:44px;">Create Project</button>
+    </div>
+
+    <div class="spacer"></div>
+    <div class="project-title" style="font-size:16px; margin-bottom:8px;">Hosting location</div>
+    <div class="muted" style="font-size:12px; margin-bottom:10px;">
+      We measure latency from your browser and preselect the best region. You can choose another one.
+    </div>
+
+    <input type="hidden" id="hosting-location" name="hosting_location" value="{{ prefill_hosting_location or '' }}">
+    <input type="hidden" id="hosting-ping-ms" name="hosting_ping_ms" value="{{ prefill_hosting_ping or '' }}">
+
+    <div id="hosting-grid" class="grid" style="grid-template-columns: repeat(auto-fit, minmax(165px, 1fr)); gap:10px;">
+      {% for item in hosting_locations %}
+      <button
+        type="button"
+        class="btn ghost hosting-option"
+        data-location="{{ item.code }}"
+        data-probe-url="{{ item.probe_url }}"
+        style="justify-content: space-between; text-align:left; width:100%;"
+      >
+        <span>
+          <strong style="display:block; color:var(--text);">{{ item.label }}</strong>
+          <span class="muted" style="font-size:11px;">{{ item.region }}</span>
+        </span>
+        <span class="muted" data-ping style="font-size:11px;">Testing...</span>
+      </button>
+      {% endfor %}
+    </div>
+
+    <div class="row" style="justify-content: space-between; margin-top:10px;">
+      <div id="hosting-summary" class="muted" style="font-size:12px;">Measuring ping to hosting regions...</div>
+      <button class="btn primary" type="submit" style="height:42px;">Create Project</button>
     </div>
     <div class="muted" style="font-size:12px; margin-top:8px;">Slug format: 2–31 chars, lowercase letters/numbers, hyphens only.</div>
   </form>
@@ -32,11 +70,15 @@
 
 <div class="grid">
   {% for project in projects %}
+  {% set loc = hosting_location_map.get(project.hosting_location or '') %}
   <div class="card">
     <div class="row" style="justify-content: space-between;">
       <div>
         <div class="project-title">{{ project.display_name or project.slug }}</div>
         <div class="muted" style="font-size:12px;">Slug: {{ project.slug }} · Owner: {{ project.owner.username }}</div>
+        <div class="muted" style="font-size:12px; margin-top:4px;">
+          Hosting: {{ loc['label'] if loc else 'Auto' }}{% if project.hosting_ping_ms %} · {{ project.hosting_ping_ms }}ms{% endif %}
+        </div>
         {% if project.status == "deleting" %}
           <div class="muted" style="font-size:12px; color:#fcd34d; margin-top:6px;">Deletion in progress. Resources are being removed in background.</div>
         {% elif project.status == "delete_failed" %}
@@ -87,4 +129,108 @@
   </div>
   {% endfor %}
 </div>
+
+<script>
+  (function () {
+    const cards = Array.from(document.querySelectorAll('.hosting-option'));
+    const hiddenLocation = document.getElementById('hosting-location');
+    const hiddenPing = document.getElementById('hosting-ping-ms');
+    const summary = document.getElementById('hosting-summary');
+    if (!cards.length || !hiddenLocation || !hiddenPing || !summary) {
+      return;
+    }
+
+    const state = {};
+    let manualSelection = false;
+
+    function probeOnce(url, timeoutMs) {
+      return new Promise((resolve) => {
+        const img = new Image();
+        let done = false;
+        const start = performance.now();
+        const finish = (ok) => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          resolve(ok ? Math.round(performance.now() - start) : null);
+        };
+        const token = `cb=${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        img.onload = () => finish(true);
+        img.onerror = () => finish(false);
+        const timer = setTimeout(() => finish(false), timeoutMs);
+        img.src = `${url}${url.includes('?') ? '&' : '?'}${token}`;
+      });
+    }
+
+    async function measurePing(url) {
+      const first = await probeOnce(url, 5000);
+      const second = await probeOnce(url, 5000);
+      const values = [first, second].filter((v) => typeof v === 'number');
+      if (!values.length) return null;
+      return Math.round(values.reduce((a, b) => a + b, 0) / values.length);
+    }
+
+    function pickCard(code) {
+      cards.forEach((card) => {
+        if (card.dataset.location === code) {
+          card.classList.remove('ghost');
+          card.style.borderColor = 'rgba(34,211,238,0.6)';
+          card.style.background = 'rgba(34,211,238,0.12)';
+        } else {
+          card.classList.add('ghost');
+          card.style.borderColor = 'rgba(255,255,255,0.1)';
+          card.style.background = 'transparent';
+        }
+      });
+      hiddenLocation.value = code || '';
+      const selectedPing = state[code];
+      hiddenPing.value = typeof selectedPing === 'number' ? String(selectedPing) : '';
+      if (!code) {
+        summary.textContent = 'Auto selection is enabled.';
+        return;
+      }
+      const pingLabel = typeof selectedPing === 'number' ? `${selectedPing}ms` : 'timeout';
+      const label = cards.find((c) => c.dataset.location === code)?.querySelector('strong')?.textContent || code;
+      summary.textContent = `Selected region: ${label} (${pingLabel}).`;
+    }
+
+    cards.forEach((card) => {
+      card.addEventListener('click', () => {
+        manualSelection = true;
+        pickCard(card.dataset.location || '');
+      });
+    });
+
+    const prefillCode = hiddenLocation.value;
+    if (prefillCode) {
+      pickCard(prefillCode);
+      manualSelection = true;
+    }
+
+    Promise.all(cards.map(async (card) => {
+      const code = card.dataset.location || '';
+      const pingNode = card.querySelector('[data-ping]');
+      const probeUrl = card.dataset.probeUrl || '';
+      const ping = await measurePing(probeUrl);
+      state[code] = ping;
+      if (pingNode) {
+        pingNode.textContent = typeof ping === 'number' ? `${ping}ms` : 'timeout';
+      }
+    })).then(() => {
+      if (!manualSelection) {
+        const best = Object.entries(state)
+          .filter(([, ping]) => typeof ping === 'number')
+          .sort((a, b) => a[1] - b[1])[0];
+        if (best) {
+          pickCard(best[0]);
+          return;
+        }
+        const firstCode = cards[0]?.dataset.location || '';
+        pickCard(firstCode);
+      } else {
+        pickCard(hiddenLocation.value || '');
+      }
+    });
+  })();
+</script>
 {% endblock %}

@@ -1,10 +1,22 @@
 {% extends "base.html" %}
 {% block content %}
+<style>
+  @media (max-width: 1080px) {
+    .branch-layout {
+      grid-template-columns: 1fr !important;
+    }
+  }
+  @media (max-width: 860px) {
+    .repo-grid {
+      grid-template-columns: 1fr !important;
+    }
+  }
+</style>
 <div class="card" style="margin-bottom:16px;">
   <div class="row" style="justify-content: space-between;">
     <div>
       <div class="project-title">Project Settings</div>
-      <div class="muted" style="font-size:12px;">Manage branches, capacity, and domains.</div>
+      <div class="muted" style="font-size:12px;">Top-level project config, then branch-level operations.</div>
     </div>
     <a class="btn" href="/">Back</a>
   </div>
@@ -28,10 +40,12 @@
 {% else %}
 
 <form class="card" method="post" action="/projects/{{ project.id }}/settings" style="margin-bottom:16px;">
-  <div class="row" style="justify-content: space-between; margin-bottom:12px;">
-    <div class="project-title">Identity</div>
+  <div class="row" style="justify-content: space-between; margin-bottom:10px;">
+    <div class="project-title" style="margin:0;">Project Settings</div>
+    <button class="btn primary" type="submit">Save project settings</button>
   </div>
-  <div class="grid">
+
+  <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));">
     <div>
       <div class="muted" style="font-size:12px; margin-bottom:6px;">Display name</div>
       <input class="input" name="display_name" value="{{ project.display_name or project.slug }}" />
@@ -40,11 +54,23 @@
       <div class="muted" style="font-size:12px; margin-bottom:6px;">Slug (immutable)</div>
       <input class="input" value="{{ project.slug }}" disabled />
     </div>
+    <div>
+      <div class="muted" style="font-size:12px; margin-bottom:6px;">Hosting location</div>
+      <select class="input" name="hosting_location">
+        <option value="">Auto</option>
+        {% for item in hosting_locations %}
+          <option value="{{ item.code }}" {% if project.hosting_location == item.code %}selected{% endif %}>{{ item.label }} ({{ item.region }})</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <div class="muted" style="font-size:12px; margin-bottom:6px;">Measured ping (ms)</div>
+      <input class="input" type="number" min="1" name="hosting_ping_ms" value="{{ project.hosting_ping_ms or '' }}" />
+    </div>
   </div>
-  <div class="spacer"></div>
 
-  <div class="project-title" style="margin-bottom:10px;">Branch Mapping</div>
-  <div class="grid">
+  <div class="spacer"></div>
+  <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));">
     <div>
       <div class="muted" style="font-size:12px; margin-bottom:6px;">Development branch</div>
       <input class="input" name="dev_branch" value="{{ project.dev_branch or 'dev' }}" />
@@ -58,10 +84,9 @@
       <input class="input" name="prod_branch" value="{{ project.prod_branch or 'main' }}" />
     </div>
   </div>
-  <div class="spacer"></div>
 
-  <div class="project-title" style="margin-bottom:10px;">Capacity</div>
-  <div class="grid">
+  <div class="spacer"></div>
+  <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));">
     <div>
       <div class="muted" style="font-size:12px; margin-bottom:6px;">Database workers</div>
       <input class="input" type="number" min="1" name="workers" value="{{ project.workers or 1 }}" />
@@ -74,38 +99,29 @@
       <div class="muted" style="font-size:12px; margin-bottom:6px;">Staging branches</div>
       <input class="input" type="number" min="1" name="staging_slots" value="{{ project.staging_slots or 1 }}" />
     </div>
-  </div>
-  <div class="spacer"></div>
-
-  <div class="project-title" style="margin-bottom:10px;">Subscription</div>
-  <div class="grid">
-    <div>
-      <div class="muted" style="font-size:12px; margin-bottom:6px;">Subscription code</div>
-      <input class="input" name="subscription_code" value="{{ project.subscription_code or '' }}" />
-    </div>
     <div>
       <div class="muted" style="font-size:12px; margin-bottom:6px;">Odoo version (community)</div>
       <input class="input" name="odoo_version" value="{{ project.odoo_version or '19.0' }}" />
     </div>
   </div>
-  <div class="spacer"></div>
 
-  <div class="row" style="justify-content: flex-end;">
-    <button class="btn primary" type="submit">Save settings</button>
+  <div class="spacer"></div>
+  <div>
+    <div class="muted" style="font-size:12px; margin-bottom:6px;">Subscription code</div>
+    <input class="input" name="subscription_code" value="{{ project.subscription_code or '' }}" />
   </div>
 </form>
 
 <div class="card" style="margin-bottom:16px;">
-  <div class="row" style="justify-content: space-between;">
+  <div class="row" style="justify-content: space-between; margin-bottom:10px;">
     <div>
-      <div class="project-title">GitHub</div>
-      <div class="muted" style="font-size:12px;">Connect a repository to enable branch-based deployments.</div>
+      <div class="project-title" style="margin:0;">Repository</div>
+      <div class="muted" style="font-size:12px;">Connect GitHub to enable branch-triggered updates.</div>
     </div>
     <a class="btn" href="{{ github_install_url }}" target="_blank">Install GitHub App</a>
   </div>
-  <div class="spacer"></div>
   <form method="post" action="/projects/{{ project.id }}/repo">
-    <div class="grid">
+    <div class="grid repo-grid" style="grid-template-columns: 1.4fr 1fr auto; align-items: end;">
       <div>
         <div class="muted" style="font-size:12px; margin-bottom:6px;">Repository (owner/name)</div>
         <input class="input" name="repo_full_name" value="{{ project.repo_full_name or '' }}" list="repo-list" />
@@ -126,330 +142,201 @@
           {% endfor %}
         </select>
       </div>
-    </div>
-    <div class="spacer"></div>
-    <div class="row" style="justify-content: flex-end;">
-      <button class="btn primary" type="submit">Connect repository</button>
+      <button class="btn primary" type="submit" style="height:44px;">Connect</button>
     </div>
   </form>
-
-  {% if project.repo_full_name %}
-  <div class="spacer"></div>
-  <div class="muted" style="font-size:12px;">Connected repository: <strong>{{ project.repo_full_name }}</strong></div>
-  {% endif %}
 </div>
 
-<div class="card" style="margin-bottom:16px;">
-  <div class="project-title">Recent Builds</div>
-  {% if builds %}
-    {% for build in builds %}
-      <div class="row" style="justify-content: space-between; margin-bottom:6px;">
-        <span class="muted" style="font-size:12px;">{{ build.created_at.strftime('%Y-%m-%d %H:%M') }}</span>
-        <span>{{ build.branch or 'n/a' }} → {{ build.env or 'n/a' }}</span>
-        <span class="muted" style="font-size:12px;">{{ build.status or '' }}</span>
-      </div>
-      <div class="muted" style="font-size:12px; margin-bottom:10px;">{{ build.message or '' }}</div>
-    {% endfor %}
-  {% else %}
-    <div class="muted" style="font-size:12px;">No builds yet.</div>
-  {% endif %}
-</div>
+{% set dev_env = (project.envs | selectattr("name","equalto","dev") | list | first) %}
+{% set staging_env = (project.envs | selectattr("name","equalto","staging") | list | first) %}
+{% set prod_env = (project.envs | selectattr("name","equalto","prod") | list | first) %}
 
-<div class="card" style="margin-bottom:16px;">
-  <div class="project-title">Environments & Domains</div>
-  <div class="muted" style="font-size:12px; margin-bottom:12px;">
-    Flow supports Dev → Staging/Prod, Staging → Prod, and Prod → Staging (copy). Dragging Staging/Prod to Dev resets Dev to empty. Pushes to the dev branch reset dev automatically.
-  </div>
-</div>
-
-<div class="grid" style="grid-template-columns: 220px 1fr; align-items: start;">
-  <div class="card" style="height: fit-content;">
+<div class="grid branch-layout" style="grid-template-columns: 250px 1fr; align-items:start; gap:14px;">
+  <aside class="card" id="branches">
     <div class="project-title">Branches</div>
-    <div class="muted" style="font-size:12px; margin-bottom:12px;">Select an environment.</div>
-    {% for env_name in ["dev","staging","prod"] %}
+    <div class="muted" style="font-size:12px; margin-bottom:12px;">Left panel like Odoo.sh: choose active branch.</div>
+    {% for env_name in ["dev", "staging", "prod"] %}
+      {% set env_obj = (project.envs | selectattr("name","equalto", env_name) | list | first) %}
       {% set status = env_status.get(env_name) %}
-      <a class="btn ghost" href="#env-{{ env_name }}" style="width:100%; justify-content: space-between; margin-bottom:8px;">
-        <span class="env-pill">{{ env_name }}</span>
-        <span class="muted" style="font-size:11px;">
-          {{ status.message if status else "Not created" }}
+      <a class="btn {% if selected_env == env_name %}primary{% else %}ghost{% endif %}" href="/projects/{{ project.id }}/settings?env={{ env_name }}&tab={{ selected_tab }}#branch-workspace" style="width:100%; justify-content:space-between; margin-bottom:8px;">
+        <span class="env-pill" style="{% if selected_env == env_name %}background:rgba(11,15,26,0.2); color:#0b0f1a; border-color:rgba(11,15,26,0.2);{% endif %}">{{ env_name }}</span>
+        <span class="muted" style="font-size:11px; {% if selected_env == env_name %}color:#0b0f1a; opacity:0.8;{% endif %}">
+          {% if env_obj %}{{ status.message if status else 'Unknown' }}{% else %}Not created{% endif %}
         </span>
       </a>
     {% endfor %}
-  </div>
+  </aside>
 
-  <div>
-    {% set prod_env = (project.envs | selectattr("name","equalto","prod") | list | first) %}
-    {% set staging_env = (project.envs | selectattr("name","equalto","staging") | list | first) %}
-    {% set dev_env = (project.envs | selectattr("name","equalto","dev") | list | first) %}
-    {% for env_name in ["dev","staging","prod"] %}
-      {% set env = (project.envs | selectattr("name","equalto", env_name) | list | first) %}
-      {% set status = env_status.get(env_name) %}
-      <div
-        id="env-{{ env_name }}"
-        class="card env-card"
-        data-env="{{ env_name }}"
-        data-project="{{ project.id }}"
-        data-env-exists="{{ 1 if env else 0 }}"
-        draggable="{{ 'true' if env else 'false' }}"
-        style="margin-bottom:12px; background: #0b1220;"
-      >
-        <div class="row" style="justify-content: space-between;">
-          <div class="row">
-            <span class="env-pill">{{ env_name }}</span>
-            {% if env %}
-              <span class="muted" style="font-size:12px;">{{ env.host }}</span>
-              <span class="muted" style="font-size:12px;">· {{ status.message if status else "Unknown" }}</span>
-            {% else %}
-              <span class="muted" style="font-size:12px;">Not created yet</span>
-            {% endif %}
-          </div>
-          <div class="row">
-            {% if env %}
-              <a class="btn" href="/projects/{{ project.id }}/env/{{ env_name }}/open">
-                {{ "Open" if status and status.ready else "Open (loading)" }}
-              </a>
-            {% endif %}
-            {% if env_name != "dev" and env %}
-              <form method="post" action="/projects/{{ project.id }}/promote">
-                <input type="hidden" name="source_env" value="{{ "dev" if env_name == "staging" else "staging" }}" />
-                <input type="hidden" name="target_env" value="{{ env_name }}" />
-                <button class="btn ghost" type="submit">
-                  {{ "Promote from Dev" if env_name == "staging" else "Promote from Staging" }}
-                </button>
-              </form>
-            {% elif env_name == "staging" and not env %}
-              {% if dev_env or prod_env %}
-                <div class="row">
-                  <select class="input" id="staging-source-{{ project.id }}">
-                    {% if prod_env %}
-                      <option value="prod">Copy from Prod</option>
-                    {% endif %}
-                    {% if dev_env %}
-                      <option value="dev">Copy from Dev</option>
-                    {% endif %}
-                  </select>
-                  <button class="btn ghost" type="button" onclick="createStaging({{ project.id }})">Create Env</button>
-                </div>
-              {% else %}
-                <span class="muted" style="font-size:12px;">Create dev first</span>
-              {% endif %}
-            {% elif env_name == "prod" and not env %}
-              {% if staging_env or dev_env %}
-                <div class="row">
-                  <select class="input" id="prod-source-{{ project.id }}">
-                    {% if staging_env %}
-                      <option value="staging">Create from Staging</option>
-                    {% endif %}
-                    {% if dev_env %}
-                      <option value="dev">Create from Dev</option>
-                    {% endif %}
-                  </select>
-                  <button class="btn ghost" type="button" onclick="createProd({{ project.id }})">Create Env</button>
-                </div>
-              {% else %}
-                <span class="muted" style="font-size:12px;">Create dev first</span>
-              {% endif %}
-            {% endif %}
-            {% if env_name == "dev" and not env %}
-              <form method="post" action="/projects/{{ project.id }}/envs/create">
-                <input type="hidden" name="env" value="dev" />
-                <button class="btn ghost" type="submit">Create Dev</button>
-              </form>
-            {% endif %}
-            {% if env_name == "dev" and env %}
-              <form method="post" action="/projects/{{ project.id }}/reset">
-                <input type="hidden" name="env" value="dev" />
-                <button class="btn ghost danger" type="submit">Reset Dev (empty)</button>
-              </form>
-            {% endif %}
-            {% if env_name == "staging" and prod_env %}
-              <form method="post" action="/projects/{{ project.id }}/reset-from-prod">
-                <input type="hidden" name="target_env" value="{{ env_name }}" />
-                <button class="btn ghost" type="submit">Reset from Prod</button>
-              </form>
-            {% endif %}
-          </div>
-        </div>
+  <section class="card" id="branch-workspace">
+    <div class="row" style="justify-content: space-between; margin-bottom:10px;">
+      <div>
+        <div class="project-title" style="margin:0;">Branch Workspace · {{ selected_env }}</div>
+        {% if selected_env_obj %}
+          <div class="muted" style="font-size:12px; margin-top:4px;">{{ selected_env_obj.host }} · {{ env_status.get(selected_env).message if env_status.get(selected_env) else 'Unknown' }}</div>
+        {% else %}
+          <div class="muted" style="font-size:12px; margin-top:4px;">Environment not created yet.</div>
+        {% endif %}
+      </div>
+      <div class="row" style="justify-content:flex-end;">
+        {% if selected_env_obj %}
+          <a class="btn" href="/projects/{{ project.id }}/env/{{ selected_env }}/open">Open</a>
+        {% endif %}
 
-        {% if env %}
-          <div class="spacer"></div>
-          <div class="project-title" style="margin-bottom:10px;">Environment Configuration</div>
-          <div class="muted" style="font-size:12px; margin-bottom:10px;">
-            Overrides project defaults for this branch.
-          </div>
-          <form method="post" action="/projects/{{ project.id }}/envs/{{ env.id }}/settings">
-            <div class="grid">
-              <div>
-                <div class="muted" style="font-size:12px; margin-bottom:6px;">Database workers</div>
-                <input class="input" type="number" min="1" name="workers" value="{{ env.workers or project.workers or 1 }}" />
-              </div>
-              <div>
-                <div class="muted" style="font-size:12px; margin-bottom:6px;">Filestore size (Gi)</div>
-                <input class="input" type="number" min="1" name="storage_gb" value="{{ env.storage_gb or project.storage_gb or 1 }}" />
-              </div>
-              <div>
-                <div class="muted" style="font-size:12px; margin-bottom:6px;">Odoo version (community)</div>
-                <input class="input" name="odoo_version" value="{{ env.odoo_version or project.odoo_version or '19.0' }}" />
-              </div>
-            </div>
-            <div class="spacer"></div>
-            <div class="row" style="justify-content: flex-end;">
-              <button class="btn primary" type="submit">Save env settings</button>
-            </div>
+        {% if selected_env == 'dev' and selected_env_obj %}
+          <form method="post" action="/projects/{{ project.id }}/reset">
+            <input type="hidden" name="env" value="dev" />
+            <button class="btn ghost danger" type="submit">Reset dev (empty)</button>
           </form>
+        {% endif %}
 
-          <div class="spacer"></div>
-          <div class="muted" style="font-size:12px; margin-bottom:6px;">Custom domains</div>
-          {% if env.domains %}
-            {% for domain in env.domains %}
-              <div class="row" style="justify-content: space-between; margin-bottom:6px;">
-                <span>{{ domain.host }}</span>
-                <form method="post" action="/projects/{{ project.id }}/domains/{{ domain.id }}/delete">
-                  <button class="btn ghost danger" type="submit">Remove</button>
-                </form>
+        {% if selected_env == 'staging' %}
+          {% if dev_env %}
+          <form method="post" action="/projects/{{ project.id }}/promote">
+            <input type="hidden" name="source_env" value="dev" />
+            <input type="hidden" name="target_env" value="staging" />
+            <button class="btn ghost" type="submit">Promote dev → staging</button>
+          </form>
+          {% endif %}
+          {% if prod_env %}
+          <form method="post" action="/projects/{{ project.id }}/reset-from-prod">
+            <input type="hidden" name="target_env" value="staging" />
+            <button class="btn ghost" type="submit">Copy prod → staging</button>
+          </form>
+          {% endif %}
+        {% endif %}
+
+        {% if selected_env == 'prod' %}
+          {% if staging_env %}
+          <form method="post" action="/projects/{{ project.id }}/promote">
+            <input type="hidden" name="source_env" value="staging" />
+            <input type="hidden" name="target_env" value="prod" />
+            <button class="btn ghost" type="submit">Promote staging → prod</button>
+          </form>
+          {% endif %}
+          {% if dev_env %}
+          <form method="post" action="/projects/{{ project.id }}/promote">
+            <input type="hidden" name="source_env" value="dev" />
+            <input type="hidden" name="target_env" value="prod" />
+            <button class="btn ghost" type="submit">Promote dev → prod</button>
+          </form>
+          {% endif %}
+        {% endif %}
+
+        {% if not selected_env_obj %}
+          {% if selected_env == 'dev' %}
+            <form method="post" action="/projects/{{ project.id }}/envs/create">
+              <input type="hidden" name="env" value="dev" />
+              <button class="btn primary" type="submit">Create dev</button>
+            </form>
+          {% elif selected_env == 'staging' %}
+            {% if prod_env %}
+              <form method="post" action="/projects/{{ project.id }}/reset-from-prod">
+                <input type="hidden" name="target_env" value="staging" />
+                <button class="btn primary" type="submit">Create staging from prod</button>
+              </form>
+            {% elif dev_env %}
+              <form method="post" action="/projects/{{ project.id }}/promote">
+                <input type="hidden" name="source_env" value="dev" />
+                <input type="hidden" name="target_env" value="staging" />
+                <button class="btn primary" type="submit">Create staging from dev</button>
+              </form>
+            {% endif %}
+          {% elif selected_env == 'prod' %}
+            {% if staging_env %}
+              <form method="post" action="/projects/{{ project.id }}/promote">
+                <input type="hidden" name="source_env" value="staging" />
+                <input type="hidden" name="target_env" value="prod" />
+                <button class="btn primary" type="submit">Create prod from staging</button>
+              </form>
+            {% elif dev_env %}
+              <form method="post" action="/projects/{{ project.id }}/promote">
+                <input type="hidden" name="source_env" value="dev" />
+                <input type="hidden" name="target_env" value="prod" />
+                <button class="btn primary" type="submit">Create prod from dev</button>
+              </form>
+            {% endif %}
+          {% endif %}
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="row" style="margin-bottom:12px; gap:8px;">
+      <a class="btn {% if selected_tab == 'history' %}primary{% else %}ghost{% endif %}" href="/projects/{{ project.id }}/settings?env={{ selected_env }}&tab=history#branch-workspace">History</a>
+      <a class="btn {% if selected_tab == 'logs' %}primary{% else %}ghost{% endif %}" href="/projects/{{ project.id }}/settings?env={{ selected_env }}&tab=logs#branch-workspace">Logs</a>
+      <a class="btn {% if selected_tab == 'settings' %}primary{% else %}ghost{% endif %}" href="/projects/{{ project.id }}/settings?env={{ selected_env }}&tab=settings#branch-workspace">Branch settings</a>
+    </div>
+
+    {% if selected_tab == 'history' %}
+      {% if branch_history %}
+        {% for build in branch_history %}
+          <div class="card" style="background:#0b1220; margin-bottom:8px; border-color:rgba(255,255,255,0.06); box-shadow:none;">
+            <div class="row" style="justify-content:space-between; margin-bottom:6px;">
+              <div style="font-weight:600;">
+                {{ (build.env or selected_env)|upper }} · {{ build.status or 'event' }}
               </div>
+              <div class="muted" style="font-size:12px;">{{ build.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</div>
+            </div>
+            <div class="muted" style="font-size:12px; margin-bottom:4px;">Branch: {{ build.branch or 'n/a' }}{% if build.sha %} · SHA: {{ build.sha[:8] }}{% endif %}</div>
+            <div style="font-size:13px;">{{ build.message or '-' }}</div>
+          </div>
+        {% endfor %}
+      {% else %}
+        <div class="muted" style="font-size:12px;">No history yet for {{ selected_env }}.</div>
+      {% endif %}
+    {% elif selected_tab == 'logs' %}
+      <div class="card" style="background:#0b1220; border-color:rgba(255,255,255,0.06); box-shadow:none;">
+        <div class="muted" style="font-size:12px; margin-bottom:8px;">Latest runtime logs for {{ selected_env }}.</div>
+        <pre style="white-space:pre-wrap; margin:0; font-size:12px; line-height:1.35; max-height:520px; overflow:auto;">{{ branch_logs }}</pre>
+      </div>
+    {% else %}
+      {% if selected_env_obj %}
+        <form method="post" action="/projects/{{ project.id }}/envs/{{ selected_env_obj.id }}/settings" class="card" style="background:#0b1220; border-color:rgba(255,255,255,0.06); box-shadow:none; margin-bottom:10px;">
+          <div class="project-title" style="font-size:16px; margin-bottom:10px;">Branch configuration</div>
+          <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));">
+            <div>
+              <div class="muted" style="font-size:12px; margin-bottom:6px;">Database workers</div>
+              <input class="input" type="number" min="1" name="workers" value="{{ selected_env_obj.workers or project.workers or 1 }}" />
+            </div>
+            <div>
+              <div class="muted" style="font-size:12px; margin-bottom:6px;">Filestore size (Gi)</div>
+              <input class="input" type="number" min="1" name="storage_gb" value="{{ selected_env_obj.storage_gb or project.storage_gb or 1 }}" />
+            </div>
+            <div>
+              <div class="muted" style="font-size:12px; margin-bottom:6px;">Odoo version (community)</div>
+              <input class="input" name="odoo_version" value="{{ selected_env_obj.odoo_version or project.odoo_version or '19.0' }}" />
+            </div>
+          </div>
+          <div class="spacer"></div>
+          <div class="row" style="justify-content:flex-end;">
+            <button class="btn primary" type="submit">Save branch settings</button>
+          </div>
+        </form>
+
+        <div class="card" style="background:#0b1220; border-color:rgba(255,255,255,0.06); box-shadow:none;">
+          <div class="project-title" style="font-size:16px; margin-bottom:10px;">Custom domains</div>
+          {% if selected_env_obj.domains %}
+            {% for domain in selected_env_obj.domains %}
+            <div class="row" style="justify-content:space-between; margin-bottom:8px;">
+              <span>{{ domain.host }}</span>
+              <form method="post" action="/projects/{{ project.id }}/domains/{{ domain.id }}/delete">
+                <button class="btn ghost danger" type="submit">Remove</button>
+              </form>
+            </div>
             {% endfor %}
           {% else %}
-            <div class="muted" style="font-size:12px;">No custom domains yet.</div>
+            <div class="muted" style="font-size:12px; margin-bottom:10px;">No custom domains yet.</div>
           {% endif %}
-          <div class="spacer"></div>
           <form method="post" action="/projects/{{ project.id }}/domains" class="row">
-            <input type="hidden" name="env_id" value="{{ env.id }}" />
+            <input type="hidden" name="env_id" value="{{ selected_env_obj.id }}" />
             <input class="input" name="host" placeholder="custom.domain.com" required />
             <button class="btn primary" type="submit">Add domain</button>
           </form>
-        {% endif %}
-      </div>
-    {% endfor %}
-  </div>
+        </div>
+      {% else %}
+        <div class="muted" style="font-size:12px;">Create {{ selected_env }} first, then branch settings will appear here.</div>
+      {% endif %}
+    {% endif %}
+  </section>
 </div>
-
-<script>
-  (function () {
-    const cards = document.querySelectorAll(".env-card");
-    let dragged = null;
-
-    function clearTargets() {
-      cards.forEach((card) => card.classList.remove("drop-target"));
-    }
-
-    async function postAction(url, data) {
-      const body = new URLSearchParams(data);
-      const res = await fetch(url, {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body,
-      });
-      if (!res.ok) {
-        const text = await res.text();
-        alert(text || "Action failed");
-      }
-      // Keep backend redirect query params (?error= / ?notice=) instead of losing them on reload.
-      window.location.href = res.url || window.location.href;
-    }
-
-    window.createStaging = function (projectId) {
-      const select = document.getElementById(`staging-source-${projectId}`);
-      if (!select) return;
-      const source = select.value;
-      if (source === "prod") {
-        if (confirm("Create Staging from Prod? This copies production data.")) {
-          postAction(`/projects/${projectId}/reset-from-prod`, { target_env: "staging" });
-        }
-        return;
-      }
-      if (confirm("Create Staging from Dev?")) {
-        postAction(`/projects/${projectId}/promote`, { source_env: "dev", target_env: "staging" });
-      }
-    };
-
-    window.createProd = function (projectId) {
-      const select = document.getElementById(`prod-source-${projectId}`);
-      if (!select) return;
-      const source = select.value;
-      const label = source === "staging" ? "Staging" : "Dev";
-      if (confirm(`Create Prod from ${label}?`)) {
-        postAction(`/projects/${projectId}/promote`, { source_env: source, target_env: "prod" });
-      }
-    };
-
-    function handleDrop(sourceEnv, targetEnv, projectId) {
-      if (!sourceEnv || !targetEnv || sourceEnv === targetEnv) {
-        return;
-      }
-      const promoteUrl = `/projects/${projectId}/promote`;
-      const resetUrl = `/projects/${projectId}/reset-from-prod`;
-      const resetDevUrl = `/projects/${projectId}/reset`;
-      if (sourceEnv === "dev" && targetEnv === "staging") {
-        if (confirm("Promote Dev → Staging?")) {
-          postAction(promoteUrl, { source_env: "dev", target_env: "staging" });
-        }
-        return;
-      }
-      if (sourceEnv === "staging" && targetEnv === "prod") {
-        if (confirm("Promote Staging → Prod?")) {
-          postAction(promoteUrl, { source_env: "staging", target_env: "prod" });
-        }
-        return;
-      }
-      if (sourceEnv === "dev" && targetEnv === "prod") {
-        if (confirm("Promote Dev → Prod?")) {
-          postAction(promoteUrl, { source_env: "dev", target_env: "prod" });
-        }
-        return;
-      }
-      if (targetEnv === "dev" && (sourceEnv === "prod" || sourceEnv === "staging")) {
-        if (confirm("Reset Dev to empty? This wipes the dev database and filestore.")) {
-          postAction(resetDevUrl, { env: "dev" });
-        }
-        return;
-      }
-      if (sourceEnv === "prod" && targetEnv === "staging") {
-        if (confirm("Reset Staging from Prod? This overwrites its database and filestore.")) {
-          postAction(resetUrl, { target_env: "staging" });
-        }
-        return;
-      }
-      alert("Allowed: dev → staging/prod, staging → prod, prod → staging (copy), staging/prod → dev (reset empty).");
-    }
-
-    cards.forEach((card) => {
-      const env = card.dataset.env;
-      const projectId = card.dataset.project;
-      const exists = card.dataset.envExists === "1";
-
-      if (exists) {
-        card.setAttribute("draggable", "true");
-        card.addEventListener("dragstart", (e) => {
-          dragged = env;
-          card.classList.add("dragging");
-          e.dataTransfer.setData("text/plain", env);
-          e.dataTransfer.effectAllowed = "move";
-        });
-        card.addEventListener("dragend", () => {
-          dragged = null;
-          card.classList.remove("dragging");
-          clearTargets();
-        });
-      }
-
-      card.addEventListener("dragover", (e) => {
-        if (!dragged) return;
-        e.preventDefault();
-        card.classList.add("drop-target");
-      });
-
-      card.addEventListener("dragleave", () => card.classList.remove("drop-target"));
-
-      card.addEventListener("drop", (e) => {
-        e.preventDefault();
-        const sourceEnv = dragged || e.dataTransfer.getData("text/plain");
-        clearTargets();
-        handleDrop(sourceEnv, env, projectId);
-      });
-    });
-  })();
-</script>
 {% endif %}
 {% endblock %}

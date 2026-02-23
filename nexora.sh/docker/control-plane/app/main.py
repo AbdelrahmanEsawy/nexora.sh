@@ -58,6 +58,52 @@ KUBECTL_MUTATE_TIMEOUT = int(os.getenv("KUBECTL_MUTATE_TIMEOUT", "30"))
 DB_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "8"))
 DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "20000"))
 
+HOSTING_LOCATIONS = [
+    {
+        "code": "ca-tor",
+        "label": "Canada",
+        "region": "Americas",
+        "probe_url": "https://speedtest-tor1.digitalocean.com/1mb.test",
+    },
+    {
+        "code": "us-east",
+        "label": "Americas",
+        "region": "Americas",
+        "probe_url": "https://speedtest-nyc1.digitalocean.com/1mb.test",
+    },
+    {
+        "code": "eu-central",
+        "label": "Europe",
+        "region": "Europe",
+        "probe_url": "https://speedtest-fra1.digitalocean.com/1mb.test",
+    },
+    {
+        "code": "me",
+        "label": "Middle East",
+        "region": "Middle East",
+        "probe_url": "https://speedtest-fra1.digitalocean.com/1mb.test",
+    },
+    {
+        "code": "in-south",
+        "label": "Southern Asia",
+        "region": "Asia",
+        "probe_url": "https://speedtest-blr1.digitalocean.com/1mb.test",
+    },
+    {
+        "code": "sea",
+        "label": "Southeast Asia",
+        "region": "Asia",
+        "probe_url": "https://speedtest-sgp1.digitalocean.com/1mb.test",
+    },
+    {
+        "code": "au-syd",
+        "label": "Oceania",
+        "region": "Oceania",
+        "probe_url": "https://speedtest-syd1.digitalocean.com/1mb.test",
+    },
+]
+HOSTING_LOCATION_MAP = {item["code"]: item for item in HOSTING_LOCATIONS}
+
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 DB_PATH = os.path.join(DATA_DIR, "nexora.db")
 
@@ -90,6 +136,8 @@ class Project(Base):
     staging_slots = Column(Integer, default=DEFAULT_STAGING_SLOTS)
     subscription_code = Column(String, nullable=True)
     odoo_version = Column(String, nullable=True)
+    hosting_location = Column(String, nullable=True)
+    hosting_ping_ms = Column(Integer, nullable=True)
     repo_full_name = Column(String, nullable=True)
     repo_id = Column(String, nullable=True)
     installation_id = Column(String, nullable=True)
@@ -175,6 +223,8 @@ def ensure_schema():
             ("staging_slots", "staging_slots INTEGER"),
             ("subscription_code", "subscription_code TEXT"),
             ("odoo_version", "odoo_version TEXT"),
+            ("hosting_location", "hosting_location TEXT"),
+            ("hosting_ping_ms", "hosting_ping_ms INTEGER"),
             ("repo_full_name", "repo_full_name TEXT"),
             ("repo_id", "repo_id TEXT"),
             ("installation_id", "installation_id TEXT"),
@@ -302,6 +352,49 @@ def redirect_with_notice(path: str, message: str, extra: Optional[dict] = None):
     if extra:
         params.update(extra)
     return RedirectResponse(f"{path}?{urlencode(params)}", status_code=303)
+
+
+def normalize_hosting_location(code: str) -> str:
+    code = (code or "").strip().lower()
+    if code in HOSTING_LOCATION_MAP:
+        return code
+    return ""
+
+
+def parse_ping_ms(value: str) -> Optional[int]:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        ping = int(float(raw))
+    except Exception:
+        return None
+    return max(1, min(20000, ping))
+
+
+def hosting_location_label(code: str) -> str:
+    item = HOSTING_LOCATION_MAP.get((code or "").strip().lower())
+    if not item:
+        return "Auto"
+    return item["label"]
+
+
+def env_logs_tail(slug: str, env_name: str, lines: int = 200) -> str:
+    deploy_name = f"odoo-{slug}-{env_name}"
+    result = run_kubectl(
+        ["logs", f"deployment/{deploy_name}", f"--tail={max(20, min(lines, 1000))}"],
+        namespace=ODOO_NAMESPACE,
+        timeout=max(KUBECTL_GET_TIMEOUT, 12),
+    )
+    stdout = (result.stdout or b"").decode("utf-8", errors="replace").strip()
+    stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+    if result.returncode != 0:
+        if "NotFound" in stderr:
+            return f"No deployment found for {env_name} yet."
+        if stderr:
+            return f"Unable to fetch logs: {stderr}"
+        return "Unable to fetch logs."
+    return stdout or "No logs yet."
 
 
 def github_app_enabled() -> bool:
@@ -1393,6 +1486,8 @@ def index(request: Request):
     notice = request.query_params.get("notice")
     prefill_slug = request.query_params.get("slug", "")
     prefill_display = request.query_params.get("display_name", "")
+    prefill_hosting_location = normalize_hosting_location(request.query_params.get("hosting_location", ""))
+    prefill_hosting_ping = parse_ping_ms(request.query_params.get("hosting_ping_ms", ""))
 
     with db_session() as db:
         if user.is_admin:
@@ -1414,6 +1509,10 @@ def index(request: Request):
                 "notice": notice,
                 "prefill_slug": prefill_slug,
                 "prefill_display": prefill_display,
+                "prefill_hosting_location": prefill_hosting_location,
+                "prefill_hosting_ping": prefill_hosting_ping,
+                "hosting_locations": HOSTING_LOCATIONS,
+                "hosting_location_map": HOSTING_LOCATION_MAP,
             },
         )
 
@@ -1559,10 +1658,21 @@ async def github_webhook(request: Request):
 
 
 @app.post("/projects")
-def create_project(request: Request, slug: str = Form(...), display_name: str = Form(None)):
+def create_project(
+    request: Request,
+    slug: str = Form(...),
+    display_name: str = Form(None),
+    hosting_location: str = Form(""),
+    hosting_ping_ms: str = Form(""),
+):
     user = current_user(request)
     if not user:
         return RedirectResponse("/login")
+
+    raw_slug = (slug or "").strip().lower()
+    raw_display = (display_name or "").strip()
+    selected_hosting_location = normalize_hosting_location(hosting_location)
+    selected_hosting_ping = parse_ping_ms(hosting_ping_ms)
 
     try:
         ensure_prereqs()
@@ -1570,11 +1680,13 @@ def create_project(request: Request, slug: str = Form(...), display_name: str = 
         return redirect_with_error(
             "/",
             str(exc),
-            {"slug": (slug or "").strip(), "display_name": (display_name or "").strip()},
+            {
+                "slug": (slug or "").strip(),
+                "display_name": (display_name or "").strip(),
+                "hosting_location": selected_hosting_location,
+                "hosting_ping_ms": selected_hosting_ping or "",
+            },
         )
-
-    raw_slug = (slug or "").strip().lower()
-    raw_display = (display_name or "").strip()
     slug = re.sub(r"[^a-z0-9-]", "-", raw_slug)
     slug = re.sub(r"-+", "-", slug).strip("-")
 
@@ -1582,7 +1694,12 @@ def create_project(request: Request, slug: str = Form(...), display_name: str = 
         return redirect_with_error(
             "/",
             "Slug must be 2–31 chars, lowercase letters/numbers, and hyphens only.",
-            {"slug": slug, "display_name": raw_display},
+            {
+                "slug": slug,
+                "display_name": raw_display,
+                "hosting_location": selected_hosting_location,
+                "hosting_ping_ms": selected_hosting_ping or "",
+            },
         )
 
     with db_session() as db:
@@ -1590,7 +1707,12 @@ def create_project(request: Request, slug: str = Form(...), display_name: str = 
             return redirect_with_error(
                 "/",
                 "Project already exists.",
-                {"slug": slug, "display_name": raw_display},
+                {
+                    "slug": slug,
+                    "display_name": raw_display,
+                    "hosting_location": selected_hosting_location,
+                    "hosting_ping_ms": selected_hosting_ping or "",
+                },
             )
         project = Project(
             slug=slug,
@@ -1603,6 +1725,8 @@ def create_project(request: Request, slug: str = Form(...), display_name: str = 
             staging_slots=DEFAULT_STAGING_SLOTS,
             subscription_code="",
             odoo_version=DEFAULT_ODOO_VERSION,
+            hosting_location=selected_hosting_location or None,
+            hosting_ping_ms=selected_hosting_ping,
             status="active",
             last_error="",
             owner_id=user.id,
@@ -1704,6 +1828,10 @@ def project_settings(request: Request, project_id: int):
         return RedirectResponse("/login")
     error = request.query_params.get("error")
     notice = request.query_params.get("notice")
+    selected_env = (request.query_params.get("env") or "").strip().lower()
+    selected_tab = (request.query_params.get("tab") or "history").strip().lower()
+    if selected_tab not in {"history", "logs", "settings"}:
+        selected_tab = "history"
     with db_session() as db:
         project = get_project_for_user(db, user, project_id)
         if not project:
@@ -1711,6 +1839,15 @@ def project_settings(request: Request, project_id: int):
         db.refresh(project)
         env_order = {"prod": 0, "staging": 1, "dev": 2}
         project.envs.sort(key=lambda e: env_order.get(e.name, 99))
+        env_by_name = {e.name: e for e in project.envs}
+        if selected_env not in {"dev", "staging", "prod"}:
+            for fallback in ("dev", "staging", "prod"):
+                if fallback in env_by_name:
+                    selected_env = fallback
+                    break
+            if not selected_env:
+                selected_env = "dev"
+
         if user.is_admin:
             installations = db.query(Installation).order_by(Installation.installed_at.desc()).all()
         else:
@@ -1729,11 +1866,11 @@ def project_settings(request: Request, project_id: int):
                 .order_by(Repository.full_name.asc())
                 .all()
             )
-        builds = (
+        recent_builds = (
             db.query(BuildEvent)
             .filter(BuildEvent.project_id == project.id)
             .order_by(BuildEvent.created_at.desc())
-            .limit(10)
+            .limit(60)
             .all()
         )
         env_status = {}
@@ -1749,6 +1886,20 @@ def project_settings(request: Request, project_id: int):
                     env.last_error = str(exc)[:500]
                     db.commit()
             env_status[env.name] = env_runtime_status(project, env.name)
+
+        selected_env_obj = env_by_name.get(selected_env)
+        branch_history = [
+            build
+            for build in recent_builds
+            if (build.env or "").strip() in {"", selected_env}
+        ]
+        branch_logs = ""
+        if selected_tab == "logs":
+            if selected_env_obj:
+                branch_logs = env_logs_tail(project.slug, selected_env, lines=260)
+            else:
+                branch_logs = f"{selected_env} environment has not been created yet."
+
         return templates.TemplateResponse(
             "project_settings.html",
             {
@@ -1758,11 +1909,18 @@ def project_settings(request: Request, project_id: int):
                 "base_domain": BASE_DOMAIN,
                 "installations": installations,
                 "repos": repos,
-                "builds": builds,
+                "builds": recent_builds[:10],
+                "branch_history": branch_history[:40],
+                "selected_env": selected_env,
+                "selected_tab": selected_tab,
+                "selected_env_obj": selected_env_obj,
+                "branch_logs": branch_logs,
                 "github_install_url": github_install_url(),
                 "error": error,
                 "notice": notice,
                 "env_status": env_status,
+                "hosting_locations": HOSTING_LOCATIONS,
+                "hosting_location_map": HOSTING_LOCATION_MAP,
             },
         )
 
@@ -1859,6 +2017,8 @@ def update_project_settings(
     staging_slots: int = Form(...),
     subscription_code: str = Form(""),
     odoo_version: str = Form(DEFAULT_ODOO_VERSION),
+    hosting_location: str = Form(""),
+    hosting_ping_ms: str = Form(""),
 ):
     user = current_user(request)
     if not user:
@@ -1882,6 +2042,8 @@ def update_project_settings(
             project.staging_slots = max(1, int(staging_slots))
             project.subscription_code = subscription_code.strip()[:120]
             project.odoo_version = (odoo_version.strip() or DEFAULT_ODOO_VERSION)
+            project.hosting_location = normalize_hosting_location(hosting_location) or None
+            project.hosting_ping_ms = parse_ping_ms(hosting_ping_ms)
             db.commit()
             db.refresh(project)
 
