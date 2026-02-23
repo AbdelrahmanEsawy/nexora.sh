@@ -874,7 +874,16 @@ spec:
   backoffLimit: 1
   template:
     spec:
+      securityContext:
+        fsGroup: 101
       restartPolicy: Never
+      initContainers:
+        - name: init-permissions
+          image: busybox:1.36
+          command: ["sh", "-c", "chown -R 101:101 /var/lib/odoo"]
+          volumeMounts:
+            - name: filestore
+              mountPath: /var/lib/odoo
       containers:
         - name: init
           image: {odoo_image}
