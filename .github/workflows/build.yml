@@ -29,8 +29,8 @@ jobs:
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
-          context: ./docker/control-plane
-          file: ./docker/control-plane/Dockerfile
+          context: ./nexora.sh/docker/control-plane
+          file: ./nexora.sh/docker/control-plane/Dockerfile
           push: true
           tags: ghcr.io/abdelrahmanesawy/nexora-control-plane:latest
 
