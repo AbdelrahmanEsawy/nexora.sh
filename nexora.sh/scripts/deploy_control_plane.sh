@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
 KUBECONFIG=${KUBECONFIG:-/tmp/nexora-kubeconfig}
 APP_SECRET=${APP_SECRET:-}
 ODOO_ADMIN_PASSWD=${ODOO_ADMIN_PASSWD:-}
+IMAGE=${IMAGE:-ghcr.io/abdelrahmanesawy/nexora-control-plane:latest}
 
 if [[ -z "$APP_SECRET" || -z "$ODOO_ADMIN_PASSWD" ]]; then
   echo "APP_SECRET and ODOO_ADMIN_PASSWD are required" >&2
   exit 1
 fi
 
-kubectl --kubeconfig "$KUBECONFIG" apply -f k8s/control-plane/namespace.yaml
-kubectl --kubeconfig "$KUBECONFIG" apply -f k8s/control-plane/rbac.yaml
+kubectl --kubeconfig "$KUBECONFIG" apply -f "$ROOT_DIR/k8s/control-plane/namespace.yaml"
+kubectl --kubeconfig "$KUBECONFIG" apply -f "$ROOT_DIR/k8s/control-plane/rbac.yaml"
 echo "Skipping PVC (using emptyDir for control-plane data)"
 
 kubectl --kubeconfig "$KUBECONFIG" -n nexora-system create secret generic nexora-control-plane \
@@ -19,13 +23,16 @@ kubectl --kubeconfig "$KUBECONFIG" -n nexora-system create secret generic nexora
   --from-literal=ODOO_ADMIN_PASSWD="$ODOO_ADMIN_PASSWD" \
   --dry-run=client -o yaml | kubectl --kubeconfig "$KUBECONFIG" apply -f -
 
-kubectl --kubeconfig "$KUBECONFIG" apply -f k8s/control-plane/deployment.yaml
-kubectl --kubeconfig "$KUBECONFIG" apply -f k8s/control-plane/service.yaml
-kubectl --kubeconfig "$KUBECONFIG" apply -f k8s/control-plane/ingress.yaml
+kubectl --kubeconfig "$KUBECONFIG" apply -f "$ROOT_DIR/k8s/control-plane/deployment.yaml"
+kubectl --kubeconfig "$KUBECONFIG" apply -f "$ROOT_DIR/k8s/control-plane/service.yaml"
+kubectl --kubeconfig "$KUBECONFIG" apply -f "$ROOT_DIR/k8s/control-plane/ingress.yaml"
+
+# Allow overriding image without editing the manifest.
+kubectl --kubeconfig "$KUBECONFIG" -n nexora-system set image deployment/nexora-control-plane "control-plane=$IMAGE"
 
 if kubectl --kubeconfig "$KUBECONFIG" get crd clusterissuers.cert-manager.io >/dev/null 2>&1; then
-  kubectl --kubeconfig "$KUBECONFIG" apply -f k8s/control-plane/cluster-issuer-letsencrypt.yaml
-  kubectl --kubeconfig "$KUBECONFIG" apply -f k8s/control-plane/certificate-app-nexora-red.yaml
+  kubectl --kubeconfig "$KUBECONFIG" apply -f "$ROOT_DIR/k8s/control-plane/cluster-issuer-letsencrypt.yaml"
+  kubectl --kubeconfig "$KUBECONFIG" apply -f "$ROOT_DIR/k8s/control-plane/certificate-app-nexora-red.yaml"
 else
   echo "cert-manager CRDs not found; skipping ClusterIssuer/Certificate apply"
 fi

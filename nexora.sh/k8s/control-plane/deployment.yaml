@@ -18,8 +18,8 @@ spec:
         - name: ghcr-credentials
       containers:
         - name: control-plane
-          image: ghcr.io/abdelrahmanesawy/nexora-control-plane@sha256:0b96436086f89f755fc69a7a279fcd2d607b8adf06466ca087e02bf9c20adbb6
-          imagePullPolicy: IfNotPresent
+          image: ghcr.io/abdelrahmanesawy/nexora-control-plane:latest
+          imagePullPolicy: Always
           command: ["uvicorn"]
           args:
             [
