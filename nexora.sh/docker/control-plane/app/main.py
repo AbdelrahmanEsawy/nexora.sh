@@ -52,6 +52,7 @@ DEFAULT_STAGING_SLOTS = int(os.getenv("DEFAULT_STAGING_SLOTS", "1"))
 DEFAULT_ODOO_VERSION = os.getenv("DEFAULT_ODOO_VERSION", "19.0")
 STORAGE_CLASS_NAME = os.getenv("STORAGE_CLASS_NAME", "csi-cinder-high-speed")
 TLS_CLUSTER_ISSUER = os.getenv("TLS_CLUSTER_ISSUER", "letsencrypt-prod").strip()
+APEX_ENV = os.getenv("APEX_ENV", "dev").strip().lower()
 KUBECTL_GET_TIMEOUT = int(os.getenv("KUBECTL_GET_TIMEOUT", "8"))
 KUBECTL_MUTATE_TIMEOUT = int(os.getenv("KUBECTL_MUTATE_TIMEOUT", "30"))
 DB_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "8"))
@@ -453,7 +454,7 @@ def ensure_prereqs():
 
 
 def host_for(slug: str, env: str) -> str:
-    if env == "prod":
+    if env == APEX_ENV:
         return f"{slug}.{BASE_DOMAIN}"
     return f"{slug}--{env}.{BASE_DOMAIN}"
 
@@ -1797,7 +1798,13 @@ def update_project_settings(
 
             # Reconcile existing environments with new settings.
             for env in list(project.envs):
-                provision_env(project, env.name, env)
+                host, db_name = provision_env(project, env.name, env)
+                env.host = host
+                env.db_name = db_name
+                env.last_error = ""
+                if env.status == "provisioning":
+                    env.status = "active"
+            db.commit()
     except Exception as exc:
         return redirect_with_error(
             f"/projects/{project_id}/settings",
@@ -1847,7 +1854,9 @@ def update_env_settings(
             db.commit()
             db.refresh(env)
 
-            provision_env(project, env.name, env)
+            host, db_name = provision_env(project, env.name, env)
+            env.host = host
+            env.db_name = db_name
             env.status = "active"
             env.last_error = ""
             db.commit()

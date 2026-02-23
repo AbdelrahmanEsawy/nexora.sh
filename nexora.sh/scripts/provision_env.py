@@ -43,6 +43,12 @@ def main():
     ap.add_argument("--project", required=True, help="Project slug, e.g. new or acme")
     ap.add_argument("--env", default="prod", choices=["dev", "staging", "prod"], help="Environment name")
     ap.add_argument("--base-domain", default="nexora.red", help="Base domain")
+    ap.add_argument(
+        "--apex-env",
+        default=os.environ.get("APEX_ENV", "dev"),
+        choices=["dev", "staging", "prod"],
+        help="Environment that should use apex host <slug>.<base-domain>",
+    )
     ap.add_argument("--namespace", default="odoo-system", help="Kubernetes namespace")
     ap.add_argument("--db-name", default=None, help="Database name override")
     ap.add_argument("--admin-passwd", default=None, help="Odoo master password (admin_passwd)")
@@ -67,7 +73,7 @@ def main():
 
     project = args.project.strip().lower()
     env = args.env
-    if env == "prod":
+    if env == args.apex_env:
         host = f"{project}.{args.base_domain}"
     else:
         host = f"{project}--{env}.{args.base_domain}"

@@ -73,6 +73,8 @@ spec:
               value: csi-cinder-high-speed
             - name: TLS_CLUSTER_ISSUER
               value: letsencrypt-prod
+            - name: APEX_ENV
+              value: dev
             - name: DATA_DIR
               value: /data
             - name: APP_SECRET
