@@ -51,6 +51,11 @@ def main():
         default=os.environ.get("STORAGE_CLASS_NAME", "csi-cinder-high-speed"),
         help="StorageClassName for PVCs (empty to use cluster default)",
     )
+    ap.add_argument(
+        "--tls-issuer",
+        default=os.environ.get("TLS_CLUSTER_ISSUER", "letsencrypt-prod"),
+        help="cert-manager ClusterIssuer name (empty to skip issuer annotation)",
+    )
     ap.add_argument("--kubeconfig", default=os.environ.get("KUBECONFIG", "/tmp/nexora-kubeconfig"))
     ap.add_argument("--dry-run", action="store_true", help="Print manifest only")
     args = ap.parse_args()
@@ -80,6 +85,8 @@ def main():
     pvc_name = f"odoo-filestore-{project}-{env}"
     cfg_secret = f"odoo-config-{project}-{env}"
     storage_class_line = f"  storageClassName: {args.storage_class}\n" if args.storage_class else ""
+    issuer = (args.tls_issuer or "").strip()
+    issuer_annotation = f"\n        cert-manager.io/cluster-issuer: {issuer}" if issuer else ""
 
     manifest = dedent(f"""
     apiVersion: v1
@@ -206,10 +213,15 @@ def main():
         project: {project}
         env: {env}
       annotations:
+        nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
         nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-        nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+        nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"{issuer_annotation}
     spec:
       ingressClassName: nginx
+      tls:
+        - hosts:
+            - {host}
+          secretName: {name}-tls
       rules:
         - host: {host}
           http:

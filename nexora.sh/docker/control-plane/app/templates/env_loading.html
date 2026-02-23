@@ -15,13 +15,21 @@
   <div class="spacer"></div>
   <div class="row">
     <a class="btn ghost" href="/projects/{{ project.id }}/settings">Back</a>
-    <a class="btn" href="https://{{ env.host }}" target="_blank">Open anyway</a>
+    <a id="open-btn" class="btn disabled" href="#" target="_blank" aria-disabled="true">Open when ready</a>
   </div>
 </div>
 
 <script>
   (function () {
     const statusEl = document.getElementById("status-text");
+    const openBtn = document.getElementById("open-btn");
+    function setOpenReady(host) {
+      openBtn.classList.remove("disabled");
+      openBtn.removeAttribute("aria-disabled");
+      openBtn.href = `https://${host}`;
+      openBtn.textContent = "Open now";
+    }
+
     async function poll() {
       try {
         const res = await fetch(`/projects/{{ project.id }}/env/{{ env_name }}/status`, {
@@ -31,8 +39,16 @@
           const data = await res.json();
           statusEl.textContent = data.message || "Starting";
           if (data.ready) {
-            window.location.href = `https://{{ env.host }}`;
+            setOpenReady(data.host || "{{ env.host }}");
+            window.location.href = `https://${data.host || "{{ env.host }}"}`;
             return;
+          }
+          if (data.message && data.message.toLowerCase().includes("init failed")) {
+            openBtn.textContent = "Blocked: initialization failed";
+          } else if (data.message && data.message.toLowerCase().includes("tls")) {
+            openBtn.textContent = "Waiting for TLS";
+          } else {
+            openBtn.textContent = "Open when ready";
           }
         }
       } catch (e) {}

@@ -35,6 +35,14 @@
       align-items: center;
       justify-content: space-between;
       margin-bottom: 24px;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      flex-wrap: wrap;
     }
     .brand {
       display: flex;
@@ -56,6 +64,31 @@
       background: rgba(255,255,255,0.08);
       font-size: 12px;
       color: var(--muted);
+    }
+    .main-nav {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .nav-link {
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 600;
+      padding: 8px 12px;
+      border: 1px solid transparent;
+      border-radius: 10px;
+      transition: all 0.15s ease;
+    }
+    .nav-link:hover {
+      color: var(--text);
+      border-color: var(--border);
+      background: rgba(255,255,255,0.04);
+    }
+    .nav-link.active {
+      color: #fde68a;
+      border-color: rgba(255,255,255,0.12);
+      background: rgba(255,255,255,0.06);
     }
     .card {
       background: linear-gradient(180deg, var(--card), var(--card-2));
@@ -140,6 +173,11 @@
       margin: 0 0 16px;
       font-size: 13px;
     }
+    .banner.notice {
+      border: 1px solid rgba(52, 211, 153, 0.35);
+      background: rgba(52, 211, 153, 0.12);
+      color: #d1fae5;
+    }
     .spinner {
       width: 34px;
       height: 34px;
@@ -156,12 +194,20 @@
 <body>
   <div class="wrap">
     <header>
-      <div class="brand">
-        <div class="brand-badge"></div>
-        <div>
-          <div>Nexora</div>
-          <div class="muted" style="font-size:12px">Control Plane</div>
+      <div class="header-left">
+        <div class="brand">
+          <div class="brand-badge"></div>
+          <div>
+            <div>Nexora</div>
+            <div class="muted" style="font-size:12px">Control Plane</div>
+          </div>
         </div>
+        <nav class="main-nav">
+          <a class="nav-link {% if request.url.path == '/' or request.url.path == '/projects' %}active{% endif %}" href="/">Projects</a>
+          {% if request.url.path.startswith('/projects/') %}
+            <a class="nav-link active" href="{{ request.url.path }}">Environment</a>
+          {% endif %}
+        </nav>
       </div>
       <div class="top-right">
         {% if user %}
@@ -174,6 +220,9 @@
     </header>
     {% if error %}
       <div class="banner">{{ error }}</div>
+    {% endif %}
+    {% if notice %}
+      <div class="banner notice">{{ notice }}</div>
     {% endif %}
     {% block content %}{% endblock %}
   </div>

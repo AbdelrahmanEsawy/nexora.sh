@@ -1,19 +1,34 @@
 {% extends "base.html" %}
 {% block content %}
-<div class="card" style="margin-bottom:16px;">
-  <div class="row" style="justify-content: space-between;">
+<div class="card" id="new-project" style="margin-bottom:16px;">
+  <div class="row" style="justify-content: space-between; margin-bottom:12px;">
     <div>
       <div class="project-title">Create a Project</div>
-      <div class="muted" style="font-size:12px;">This will provision the dev environment (Odoo 19 Community). Promote to staging and prod when ready.</div>
+      <div class="muted" style="font-size:12px;">Provisions Dev first, then promote to Staging and Production.</div>
     </div>
-    <form method="post" action="/projects" style="display:flex; gap:8px; align-items:center; flex-wrap: wrap;">
-      <input class="input" type="text" name="display_name" placeholder="Project name (display)" value="{{ prefill_display or '' }}" required>
-      <input class="input" type="text" name="slug" placeholder="project-slug" value="{{ prefill_slug or '' }}" pattern="[a-z0-9][a-z0-9-]{1,30}" title="2–31 chars, lowercase letters/numbers, hyphens only" required>
-      <button class="btn primary" type="submit">Create</button>
-      <div class="muted" style="font-size:12px;">Slug: 2–31 chars, lowercase letters/numbers, hyphens only.</div>
-    </form>
   </div>
+  <form method="post" action="/projects">
+    <div class="grid" style="grid-template-columns: 1.5fr 1fr auto; align-items: end;">
+      <div>
+        <div class="muted" style="font-size:12px; margin-bottom:6px;">Display name</div>
+        <input class="input" type="text" name="display_name" placeholder="Project name (display)" value="{{ prefill_display or '' }}" required>
+      </div>
+      <div>
+        <div class="muted" style="font-size:12px; margin-bottom:6px;">Slug</div>
+        <input class="input" type="text" name="slug" placeholder="project-slug" value="{{ prefill_slug or '' }}" pattern="[a-z0-9][a-z0-9-]{1,30}" title="2–31 chars, lowercase letters/numbers, hyphens only" required>
+      </div>
+      <button class="btn primary" type="submit" style="height:44px;">Create Project</button>
+    </div>
+    <div class="muted" style="font-size:12px; margin-top:8px;">Slug format: 2–31 chars, lowercase letters/numbers, hyphens only.</div>
+  </form>
 </div>
+
+{% if not projects %}
+<div class="card" style="margin-bottom:16px;">
+  <div class="project-title">No Projects Yet</div>
+  <div class="muted" style="font-size:12px;">Create your first project to start provisioning Odoo environments.</div>
+</div>
+{% endif %}
 
 <div class="grid">
   {% for project in projects %}
@@ -22,12 +37,24 @@
       <div>
         <div class="project-title">{{ project.display_name or project.slug }}</div>
         <div class="muted" style="font-size:12px;">Slug: {{ project.slug }} · Owner: {{ project.owner.username }}</div>
+        {% if project.status == "deleting" %}
+          <div class="muted" style="font-size:12px; color:#fcd34d; margin-top:6px;">Deletion in progress. Resources are being removed in background.</div>
+        {% elif project.status == "delete_failed" %}
+          <div class="muted" style="font-size:12px; color:#fecaca; margin-top:6px;">Deletion failed: {{ project.last_error or "Unknown error" }}</div>
+        {% endif %}
       </div>
       <div class="row">
-        <a class="btn" href="/projects/{{ project.id }}/settings">Settings</a>
+        <a class="btn {% if project.status == 'deleting' %}disabled{% endif %}" href="/projects/{{ project.id }}/settings">Settings</a>
         <form method="post" action="/projects/{{ project.id }}/delete">
-          <button class="btn ghost danger" type="submit">Delete</button>
+          <button class="btn ghost danger {% if project.status == 'deleting' %}disabled{% endif %}" type="submit" {% if project.status == "deleting" %}disabled{% endif %}>
+            {{ "Deleting..." if project.status == "deleting" else "Delete" }}
+          </button>
         </form>
+        {% if project.status in ["deleting", "delete_failed"] %}
+        <form method="post" action="/projects/{{ project.id }}/delete/force">
+          <button class="btn ghost" type="submit">Force clear</button>
+        </form>
+        {% endif %}
       </div>
     </div>
     <div class="spacer"></div>
@@ -36,13 +63,22 @@
       <div class="row" style="justify-content: space-between; margin-bottom:6px;">
         <span class="env-pill">{{ env_name }}</span>
         {% if env %}
-          <a class="btn" href="/projects/{{ project.id }}/env/{{ env_name }}/open">Open</a>
+          <a class="btn {% if project.status == 'deleting' %}disabled{% endif %}" href="/projects/{{ project.id }}/env/{{ env_name }}/open">Open</a>
         {% else %}
-          <a class="btn ghost" href="/projects/{{ project.id }}/settings">Create</a>
+          <a class="btn ghost {% if project.status == 'deleting' %}disabled{% endif %}" href="/projects/{{ project.id }}/settings">Create</a>
         {% endif %}
       </div>
       {% if env %}
         <div class="muted" style="font-size:12px;">{{ env.host }}</div>
+        <div class="muted" style="font-size:12px; margin-top:2px;">
+          {% if env.status == "provisioning" %}
+            Status: provisioning
+          {% elif env.status == "failed" %}
+            <span style="color:#fecaca;">Status: failed{% if env.last_error %} · {{ env.last_error }}{% endif %}</span>
+          {% else %}
+            Status: active
+          {% endif %}
+        </div>
       {% else %}
         <div class="muted" style="font-size:12px;">Not created yet</div>
       {% endif %}

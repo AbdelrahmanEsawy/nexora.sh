@@ -71,6 +71,8 @@ spec:
               value: "1"
             - name: STORAGE_CLASS_NAME
               value: csi-cinder-high-speed
+            - name: TLS_CLUSTER_ISSUER
+              value: letsencrypt-prod
             - name: DATA_DIR
               value: /data
             - name: APP_SECRET

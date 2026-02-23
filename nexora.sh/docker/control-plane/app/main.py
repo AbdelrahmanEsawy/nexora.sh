@@ -51,6 +51,11 @@ DEFAULT_STORAGE_GB = int(os.getenv("DEFAULT_STORAGE_GB", "1"))
 DEFAULT_STAGING_SLOTS = int(os.getenv("DEFAULT_STAGING_SLOTS", "1"))
 DEFAULT_ODOO_VERSION = os.getenv("DEFAULT_ODOO_VERSION", "19.0")
 STORAGE_CLASS_NAME = os.getenv("STORAGE_CLASS_NAME", "csi-cinder-high-speed")
+TLS_CLUSTER_ISSUER = os.getenv("TLS_CLUSTER_ISSUER", "letsencrypt-prod").strip()
+KUBECTL_GET_TIMEOUT = int(os.getenv("KUBECTL_GET_TIMEOUT", "8"))
+KUBECTL_MUTATE_TIMEOUT = int(os.getenv("KUBECTL_MUTATE_TIMEOUT", "30"))
+DB_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "8"))
+DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "20000"))
 
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 DB_PATH = os.path.join(DATA_DIR, "nexora.db")
@@ -87,6 +92,8 @@ class Project(Base):
     repo_full_name = Column(String, nullable=True)
     repo_id = Column(String, nullable=True)
     installation_id = Column(String, nullable=True)
+    status = Column(String, nullable=True)
+    last_error = Column(String, nullable=True)
     owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     owner = relationship("User", back_populates="projects")
@@ -170,6 +177,8 @@ def ensure_schema():
             ("repo_full_name", "repo_full_name TEXT"),
             ("repo_id", "repo_id TEXT"),
             ("installation_id", "installation_id TEXT"),
+            ("status", "status TEXT"),
+            ("last_error", "last_error TEXT"),
         ]:
             if name not in cols:
                 conn.execute(text(f"ALTER TABLE projects ADD COLUMN {ddl}"))
@@ -202,6 +211,10 @@ def ensure_schema():
         conn.execute(
             text("UPDATE projects SET odoo_version = :v WHERE odoo_version IS NULL"),
             {"v": DEFAULT_ODOO_VERSION},
+        )
+        conn.execute(
+            text("UPDATE projects SET status = :v WHERE status IS NULL"),
+            {"v": "active"},
         )
 
         env_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(environments)"))}
@@ -278,6 +291,13 @@ SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,30}$")
 
 def redirect_with_error(path: str, message: str, extra: Optional[dict] = None):
     params = {"error": message}
+    if extra:
+        params.update(extra)
+    return RedirectResponse(f"{path}?{urlencode(params)}", status_code=303)
+
+
+def redirect_with_notice(path: str, message: str, extra: Optional[dict] = None):
+    params = {"notice": message}
     if extra:
         params.update(extra)
     return RedirectResponse(f"{path}?{urlencode(params)}", status_code=303)
@@ -382,13 +402,35 @@ def branch_from_ref(ref: str) -> str:
     return ref.split("/")[-1]
 
 
+def run_kubectl(
+    args: list[str],
+    namespace: Optional[str] = None,
+    *,
+    input_bytes: Optional[bytes] = None,
+    timeout: int = KUBECTL_MUTATE_TIMEOUT,
+) -> subprocess.CompletedProcess:
+    cmd = ["kubectl"]
+    if namespace:
+        cmd += ["-n", namespace]
+    cmd += args
+    try:
+        return subprocess.run(
+            cmd,
+            input=input_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"kubectl timed out after {timeout}s: {' '.join(cmd)}") from exc
+
+
 def restart_env(slug: str, env: str):
     name = f"odoo-{slug}-{env}"
-    subprocess.run(
-        ["kubectl", "-n", ODOO_NAMESPACE, "rollout", "restart", "deployment", name],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
+    run_kubectl(
+        ["rollout", "restart", "deployment", name],
+        namespace=ODOO_NAMESPACE,
+        timeout=KUBECTL_MUTATE_TIMEOUT,
     )
 
 
@@ -473,27 +515,85 @@ def init_job_name(slug: str, env: str) -> str:
     return name[:63].rstrip("-")
 
 
+def kubectl_get_list_json(namespace: str, kind: str, selector: str) -> Optional[dict]:
+    proc = run_kubectl(
+        ["get", kind, "-l", selector, "-o", "json"],
+        namespace=namespace,
+        timeout=KUBECTL_GET_TIMEOUT,
+    )
+    if proc.returncode != 0:
+        return None
+    try:
+        return json.loads(proc.stdout.decode("utf-8"))
+    except Exception:
+        return None
+
+
+def init_job_failure_reason(slug: str, env: str) -> str:
+    job_name = init_job_name(slug, env)
+    pods = kubectl_get_list_json(ODOO_NAMESPACE, "pods", f"job-name={job_name}")
+    items = (pods or {}).get("items") or []
+    if not items:
+        return ""
+
+    pod = sorted(items, key=lambda p: p.get("metadata", {}).get("creationTimestamp", ""))[-1]
+    status = pod.get("status", {})
+    for container in status.get("containerStatuses") or []:
+        state = container.get("state") or {}
+        terminated = state.get("terminated") or {}
+        if terminated:
+            reason = terminated.get("reason") or "Terminated"
+            message = (terminated.get("message") or "").strip()
+            return f"{reason}: {message}"[:220].rstrip(": ")
+        waiting = state.get("waiting") or {}
+        if waiting:
+            reason = waiting.get("reason") or "Waiting"
+            message = (waiting.get("message") or "").strip()
+            return f"{reason}: {message}"[:220].rstrip(": ")
+
+    phase = status.get("phase")
+    if phase and phase not in {"Running", "Succeeded"}:
+        return str(phase)[:220]
+    return ""
+
+
 def init_job_status(slug: str, env: str) -> Optional[dict]:
     job = kubectl_get_json(ODOO_NAMESPACE, "job", init_job_name(slug, env))
     if not job:
         return None
     status = job.get("status", {})
+    failed = int(status.get("failed") or 0)
+    reason = ""
+    if failed > 0:
+        for cond in status.get("conditions") or []:
+            if cond.get("type") == "Failed" and cond.get("status") == "True":
+                reason = (cond.get("message") or cond.get("reason") or "").strip()
+                break
+        if not reason:
+            reason = init_job_failure_reason(slug, env)
     return {
         "active": int(status.get("active") or 0),
         "succeeded": int(status.get("succeeded") or 0),
-        "failed": int(status.get("failed") or 0),
+        "failed": failed,
+        "reason": reason[:220],
     }
 
 
-def create_db(db_name: str):
-    conn = psycopg2.connect(
+def pg_admin_connection():
+    return psycopg2.connect(
         host=DB_HOST,
         port=DB_PORT,
         user=DB_USER,
         password=DB_PASSWORD,
         dbname="postgres",
         sslmode=DB_SSLMODE,
+        connect_timeout=DB_CONNECT_TIMEOUT,
+        options=f"-c statement_timeout={DB_STATEMENT_TIMEOUT_MS}",
     )
+
+
+def create_db(db_name: str):
+    conn = pg_admin_connection()
     conn.autocommit = True
     with conn.cursor() as cur:
         try:
@@ -504,14 +604,7 @@ def create_db(db_name: str):
 
 
 def drop_db(db_name: str):
-    conn = psycopg2.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        dbname="postgres",
-        sslmode=DB_SSLMODE,
-    )
+    conn = pg_admin_connection()
     conn.autocommit = True
     with conn.cursor() as cur:
         try:
@@ -528,14 +621,7 @@ def drop_db(db_name: str):
 def clone_db(source: str, dest: str):
     if source == dest:
         return
-    conn = psycopg2.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        dbname="postgres",
-        sslmode=DB_SSLMODE,
-    )
+    conn = pg_admin_connection()
     conn.autocommit = True
     with conn.cursor() as cur:
         cur.execute(
@@ -558,21 +644,21 @@ def clone_db(source: str, dest: str):
 
 
 def kubectl_apply(manifest: str):
-    proc = subprocess.run(
-        ["kubectl", "-n", ODOO_NAMESPACE, "apply", "-f", "-"],
-        input=manifest.encode("utf-8"),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+    proc = run_kubectl(
+        ["apply", "-f", "-"],
+        namespace=ODOO_NAMESPACE,
+        input_bytes=manifest.encode("utf-8"),
+        timeout=KUBECTL_MUTATE_TIMEOUT,
     )
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.decode("utf-8"))
 
 
 def kubectl_get_json(namespace: str, kind: str, name: str) -> Optional[dict]:
-    proc = subprocess.run(
-        ["kubectl", "-n", namespace, "get", kind, name, "-o", "json"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+    proc = run_kubectl(
+        ["get", kind, name, "-o", "json"],
+        namespace=namespace,
+        timeout=KUBECTL_GET_TIMEOUT,
     )
     if proc.returncode != 0:
         return None
@@ -580,6 +666,56 @@ def kubectl_get_json(namespace: str, kind: str, name: str) -> Optional[dict]:
         return json.loads(proc.stdout.decode("utf-8"))
     except Exception:
         return None
+
+
+def tls_secret_name(slug: str, env_name: str) -> str:
+    return f"odoo-{slug}-{env_name}-tls"
+
+
+def tls_secret_ready(secret_name: str) -> bool:
+    secret = kubectl_get_json(ODOO_NAMESPACE, "secret", secret_name)
+    if not secret:
+        return False
+    data = secret.get("data", {})
+    return bool(data.get("tls.crt") and data.get("tls.key"))
+
+
+def service_has_ready_endpoints(slug: str, env_name: str) -> bool:
+    svc_name = f"odoo-{slug}-{env_name}"
+    endpoints = kubectl_get_json(ODOO_NAMESPACE, "endpoints", svc_name)
+    if not endpoints:
+        return False
+    for subset in endpoints.get("subsets") or []:
+        if subset.get("addresses"):
+            return True
+    return False
+
+
+def odoo_pod_issue(slug: str, env_name: str) -> str:
+    pods = kubectl_get_list_json(ODOO_NAMESPACE, "pods", f"app=odoo,project={slug},env={env_name}")
+    items = (pods or {}).get("items") or []
+    if not items:
+        return "Pod not scheduled yet"
+
+    pod = sorted(items, key=lambda p: p.get("metadata", {}).get("creationTimestamp", ""))[-1]
+    status = pod.get("status", {})
+    for container in status.get("containerStatuses") or []:
+        state = container.get("state") or {}
+        waiting = state.get("waiting") or {}
+        if waiting:
+            reason = waiting.get("reason") or "Waiting"
+            message = (waiting.get("message") or "").strip()
+            return f"{reason}: {message}"[:220].rstrip(": ")
+        terminated = state.get("terminated") or {}
+        if terminated:
+            reason = terminated.get("reason") or "Terminated"
+            message = (terminated.get("message") or "").strip()
+            return f"{reason}: {message}"[:220].rstrip(": ")
+
+    phase = status.get("phase")
+    if phase and phase not in {"Running", "Succeeded"}:
+        return str(phase)[:220]
+    return ""
 
 
 def env_runtime_status(project: Project, env_name: str) -> dict:
@@ -608,42 +744,61 @@ def env_runtime_status(project: Project, env_name: str) -> dict:
     replicas = int(status.get("replicas") or 0)
     ready = int(status.get("readyReplicas") or 0)
     if replicas and ready >= replicas:
+        if not service_has_ready_endpoints(project.slug, env_name):
+            return {"ready": False, "message": "Service endpoints not ready"}
+
         job_status = init_job_status(project.slug, env_name)
         if job_status:
             if job_status.get("failed", 0) > 0:
+                reason = (job_status.get("reason") or "").strip()
+                if reason:
+                    return {"ready": False, "message": f"Init failed: {reason}"}
                 return {"ready": False, "message": "Init failed"}
             if job_status.get("active", 0) > 0:
                 return {"ready": False, "message": "Initializing database"}
         http_code = odoo_http_status(project.slug, env_name)
         if http_code and 200 <= http_code < 400:
+            if not tls_secret_ready(tls_secret_name(project.slug, env_name)):
+                return {"ready": False, "message": "Waiting for TLS certificate"}
             return {"ready": True, "message": "Ready"}
         if http_code and http_code >= 500:
-            return {"ready": False, "message": "Starting Odoo"}
+            return {"ready": False, "message": "Application returned 5xx"}
+        pod_issue = odoo_pod_issue(project.slug, env_name)
+        if pod_issue:
+            return {"ready": False, "message": f"Pod issue: {pod_issue}"}
         return {"ready": False, "message": "Starting"}
+
+    for cond in status.get("conditions") or []:
+        if cond.get("type") == "Progressing" and cond.get("status") == "False":
+            message = (cond.get("message") or cond.get("reason") or "").strip()
+            if message:
+                return {"ready": False, "message": f"Deployment blocked: {message[:220]}"}
+
     pvc_name = f"odoo-filestore-{project.slug}-{env_name}"
     pvc = kubectl_get_json(ODOO_NAMESPACE, "pvc", pvc_name)
     if pvc:
         phase = pvc.get("status", {}).get("phase")
         if phase == "Pending":
             return {"ready": False, "message": "Storage pending"}
+    pod_issue = odoo_pod_issue(project.slug, env_name)
+    if pod_issue:
+        return {"ready": False, "message": f"Pod issue: {pod_issue}"}
     return {"ready": False, "message": "Starting"}
 
 
 def kubectl_delete(kind: str, name: str):
-    subprocess.run(
-        ["kubectl", "-n", ODOO_NAMESPACE, "delete", kind, name, "--ignore-not-found"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
+    run_kubectl(
+        ["delete", kind, name, "--ignore-not-found"],
+        namespace=ODOO_NAMESPACE,
+        timeout=KUBECTL_MUTATE_TIMEOUT,
     )
 
 
 def kubectl_wait(kind: str, name: str, timeout: str = "600s"):
-    subprocess.run(
-        ["kubectl", "-n", ODOO_NAMESPACE, "wait", "--for=condition=complete", kind, name, f"--timeout={timeout}"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
+    run_kubectl(
+        ["wait", "--for=condition=complete", kind, name, f"--timeout={timeout}"],
+        namespace=ODOO_NAMESPACE,
+        timeout=max(KUBECTL_MUTATE_TIMEOUT, 90),
     )
 
 
@@ -681,7 +836,12 @@ spec:
     kubectl_delete("job", name)
 
 
-def ensure_odoo_init(project: Project, env: str, env_obj: Optional[Environment] = None):
+def ensure_odoo_init(
+    project: Project,
+    env: str,
+    env_obj: Optional[Environment] = None,
+    restart_failed: bool = False,
+):
     slug = project.slug
     job_name = init_job_name(slug, env)
     status = init_job_status(slug, env)
@@ -689,6 +849,8 @@ def ensure_odoo_init(project: Project, env: str, env_obj: Optional[Environment] 
         if status.get("succeeded", 0) > 0 or status.get("active", 0) > 0:
             return
         if status.get("failed", 0) > 0:
+            if not restart_failed:
+                return
             kubectl_delete("job", job_name)
 
     settings = effective_env_settings(project, env_obj)
@@ -753,6 +915,11 @@ def apply_domain_ingress(env: Environment, host: str):
     service_name = f"odoo-{env.project.slug}-{env.name}"
     ingress_name = ingress_name_for_domain(service_name, host)
     tls_secret = f"{ingress_name}-tls"
+    issuer_annotation = (
+        f"\n    cert-manager.io/cluster-issuer: {TLS_CLUSTER_ISSUER}"
+        if TLS_CLUSTER_ISSUER
+        else ""
+    )
     manifest = f"""
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -764,10 +931,9 @@ metadata:
     project: {env.project.slug}
     env: {env.name}
   annotations:
-    cert-manager.io/cluster-issuer: letsencrypt-http
-    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"{issuer_annotation}
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
 spec:
   ingressClassName: nginx
   tls:
@@ -800,8 +966,13 @@ def provision_env(project: Project, env: str, env_obj: Optional[Environment] = N
     storage_gb = settings["storage_gb"]
     workers = settings["workers"]
     odoo_image = odoo_image_for_version(settings["odoo_version"])
-    tls_secret = f"{name}-tls"
+    tls_secret = tls_secret_name(slug, env)
     storage_class_line = f"  storageClassName: {STORAGE_CLASS_NAME}\n" if STORAGE_CLASS_NAME else ""
+    issuer_annotation = (
+        f"\n    cert-manager.io/cluster-issuer: {TLS_CLUSTER_ISSUER}"
+        if TLS_CLUSTER_ISSUER
+        else ""
+    )
 
     create_db(db_name)
 
@@ -940,10 +1111,9 @@ metadata:
     project: {slug}
     env: {env}
   annotations:
-    cert-manager.io/cluster-issuer: letsencrypt-http
-    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"{issuer_annotation}
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
 spec:
   ingressClassName: nginx
   tls:
@@ -964,7 +1134,7 @@ spec:
 """.strip() + "\n"
 
     kubectl_apply(manifest)
-    ensure_odoo_init(project, env, env_obj)
+    ensure_odoo_init(project, env, env_obj, restart_failed=True)
     return host, db_name
 
 
@@ -975,7 +1145,7 @@ def reset_env(project: Project, env: str):
     create_db(db_name)
     wipe_filestore(pvc_name)
     restart_env(project.slug, env)
-    ensure_odoo_init(project, env)
+    ensure_odoo_init(project, env, restart_failed=True)
 
 
 def promote_env(project: Project, source_env: str, target_env: str):
@@ -993,12 +1163,14 @@ def reset_from_prod(project: Project, target_env: str):
     promote_env(project, "prod", target_env)
 
 
-def delete_env(slug: str, env: str):
+def delete_env(slug: str, env: str, domain_hosts: Optional[list[str]] = None):
     name = f"odoo-{slug}-{env}"
     pvc_name = f"odoo-filestore-{slug}-{env}"
     cfg_secret = f"odoo-config-{slug}-{env}"
 
-    # Remove custom domain ingresses tied to this env.
+    all_domain_hosts = set(domain_hosts or [])
+
+    # Remove custom domain ingresses tied to this env if project metadata still exists.
     with db_session() as db:
         project = db.query(Project).filter(Project.slug == slug).first()
         if project:
@@ -1008,8 +1180,11 @@ def delete_env(slug: str, env: str):
             ).first()
             if env_obj:
                 for domain in list(env_obj.domains):
-                    ingress_name = ingress_name_for_domain(name, domain.host)
-                    kubectl_delete("ingress", ingress_name)
+                    all_domain_hosts.add(domain.host)
+
+    for host in sorted(all_domain_hosts):
+        ingress_name = ingress_name_for_domain(name, host)
+        kubectl_delete("ingress", ingress_name)
 
     kubectl_delete("ingress", name)
     kubectl_delete("service", name)
@@ -1031,6 +1206,64 @@ def set_env_status(project_id: int, env_name: str, status: str, error: str = "")
         env.status = status
         env.last_error = (error or "")[:500]
         db.commit()
+
+
+def set_project_status(project_id: int, status: str, error: str = ""):
+    with db_session() as db:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            return
+        project.status = status
+        project.last_error = (error or "")[:500]
+        db.commit()
+
+
+def spawn_project_delete(project_id: int):
+    def _worker():
+        try:
+            with db_session() as db:
+                project = db.query(Project).filter(Project.id == project_id).first()
+                if not project:
+                    return
+                slug = project.slug
+                env_names = [env.name for env in project.envs]
+
+            errors = []
+            for env_name in env_names:
+                try:
+                    delete_env(slug, env_name)
+                except Exception as exc:
+                    errors.append(f"{env_name}: {str(exc)[:120]}")
+
+            with db_session() as db:
+                project = db.query(Project).filter(Project.id == project_id).first()
+                if not project:
+                    return
+                if errors:
+                    project.status = "delete_failed"
+                    project.last_error = "; ".join(errors)[:500]
+                    db.commit()
+                    return
+                db.delete(project)
+                db.commit()
+        except Exception as exc:
+            set_project_status(project_id, "delete_failed", str(exc))
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+
+
+def spawn_orphan_cleanup(slug: str, env_domains: dict[str, list[str]]):
+    def _worker():
+        for env_name, hosts in env_domains.items():
+            try:
+                delete_env(slug, env_name, hosts)
+            except Exception:
+                # Best-effort cleanup for force-delete mode.
+                pass
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
 
 
 def spawn_env_provision(project_id: int, env_name: str):
@@ -1067,6 +1300,7 @@ def index(request: Request):
         return RedirectResponse("/login")
 
     error = request.query_params.get("error")
+    notice = request.query_params.get("notice")
     prefill_slug = request.query_params.get("slug", "")
     prefill_display = request.query_params.get("display_name", "")
 
@@ -1075,6 +1309,7 @@ def index(request: Request):
             projects = db.query(Project).all()
         else:
             projects = db.query(Project).filter(Project.owner_id == user.id).all()
+        projects.sort(key=lambda p: p.created_at, reverse=True)
         env_order = {"prod": 0, "staging": 1, "dev": 2}
         for project in projects:
             project.envs.sort(key=lambda e: env_order.get(e.name, 99))
@@ -1086,6 +1321,7 @@ def index(request: Request):
                 "projects": projects,
                 "base_domain": BASE_DOMAIN,
                 "error": error,
+                "notice": notice,
                 "prefill_slug": prefill_slug,
                 "prefill_display": prefill_display,
             },
@@ -1277,6 +1513,8 @@ def create_project(request: Request, slug: str = Form(...), display_name: str = 
             staging_slots=DEFAULT_STAGING_SLOTS,
             subscription_code="",
             odoo_version=DEFAULT_ODOO_VERSION,
+            status="active",
+            last_error="",
             owner_id=user.id,
         )
         db.add(project)
@@ -1316,14 +1554,42 @@ def delete_project(request: Request, project_id: int):
             return RedirectResponse("/")
         if not user.is_admin and project.owner_id != user.id:
             return HTMLResponse("Forbidden", status_code=403)
+        if project.status == "deleting":
+            return redirect_with_notice("/", f"Deletion is already running for {project.display_name or project.slug}.")
+        project.status = "deleting"
+        project.last_error = ""
+        db.commit()
+        project_name = project.display_name or project.slug
 
-        for env in list(project.envs):
-            delete_env(project.slug, env.name)
+    spawn_project_delete(project_id)
+    return redirect_with_notice("/", f"Deletion started for {project_name}.")
+
+
+@app.post("/projects/{project_id}/delete/force")
+def force_delete_project(request: Request, project_id: int):
+    user = current_user(request)
+    if not user:
+        return RedirectResponse("/login")
+
+    with db_session() as db:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            return RedirectResponse("/")
+        if not user.is_admin and project.owner_id != user.id:
+            return HTMLResponse("Forbidden", status_code=403)
+
+        slug = project.slug
+        project_name = project.display_name or slug
+        env_domains = {
+            env.name: [domain.host for domain in env.domains]
+            for env in list(project.envs)
+        }
 
         db.delete(project)
         db.commit()
 
-    return RedirectResponse("/", status_code=302)
+    spawn_orphan_cleanup(slug, env_domains)
+    return redirect_with_notice("/", f"{project_name} removed from dashboard. Cleanup continues in background.")
 
 
 def get_project_for_user(db, user: User, project_id: int) -> Optional[Project]:
@@ -1335,12 +1601,19 @@ def get_project_for_user(db, user: User, project_id: int) -> Optional[Project]:
     return project
 
 
+def ensure_project_mutable(project: Project, path: str):
+    if (project.status or "active") == "deleting":
+        return redirect_with_notice(path, "Project deletion is in progress.")
+    return None
+
+
 @app.get("/projects/{project_id}/settings", response_class=HTMLResponse)
 def project_settings(request: Request, project_id: int):
     user = current_user(request)
     if not user:
         return RedirectResponse("/login")
     error = request.query_params.get("error")
+    notice = request.query_params.get("notice")
     with db_session() as db:
         project = get_project_for_user(db, user, project_id)
         if not project:
@@ -1375,13 +1648,12 @@ def project_settings(request: Request, project_id: int):
         )
         env_status = {}
         for env in project.envs:
+            if (project.status or "active") == "deleting":
+                env_status[env.name] = {"ready": False, "message": "Deleting resources"}
+                continue
             if env.name == "dev":
                 try:
                     ensure_odoo_init(project, env.name, env)
-                    if env.status == "failed" or env.last_error:
-                        env.status = "active"
-                        env.last_error = ""
-                        db.commit()
                 except Exception as exc:
                     env.status = "failed"
                     env.last_error = str(exc)[:500]
@@ -1399,6 +1671,7 @@ def project_settings(request: Request, project_id: int):
                 "builds": builds,
                 "github_install_url": github_install_url(),
                 "error": error,
+                "notice": notice,
                 "env_status": env_status,
             },
         )
@@ -1416,6 +1689,8 @@ def project_env_status(request: Request, project_id: int, env_name: str):
         project = get_project_for_user(db, user, project_id)
         if not project:
             return JSONResponse({"ready": False, "message": "Not found"}, status_code=404)
+        if (project.status or "active") == "deleting":
+            return JSONResponse({"ready": False, "message": "Project deletion in progress"}, status_code=409)
         env = db.query(Environment).filter(
             Environment.project_id == project.id, Environment.name == env_name
         ).first()
@@ -1425,10 +1700,6 @@ def project_env_status(request: Request, project_id: int, env_name: str):
         if env_name == "dev":
             try:
                 ensure_odoo_init(project, env_name, env)
-                if env.status == "failed" or env.last_error:
-                    env.status = "active"
-                    env.last_error = ""
-                    db.commit()
             except Exception as exc:
                 set_env_status(project.id, env_name, "failed", str(exc))
 
@@ -1454,6 +1725,8 @@ def project_env_open(request: Request, project_id: int, env_name: str):
         project = get_project_for_user(db, user, project_id)
         if not project:
             return HTMLResponse("Not found", status_code=404)
+        if (project.status or "active") == "deleting":
+            return redirect_with_notice(f"/projects/{project_id}/settings", "Project deletion is in progress.")
         env = db.query(Environment).filter(
             Environment.project_id == project.id, Environment.name == env_name
         ).first()
@@ -1463,10 +1736,6 @@ def project_env_open(request: Request, project_id: int, env_name: str):
         if env_name == "dev":
             try:
                 ensure_odoo_init(project, env_name, env)
-                if env.status == "failed" or env.last_error:
-                    env.status = "active"
-                    env.last_error = ""
-                    db.commit()
             except Exception as exc:
                 set_env_status(project.id, env_name, "failed", str(exc))
 
@@ -1510,6 +1779,9 @@ def update_project_settings(
             project = get_project_for_user(db, user, project_id)
             if not project:
                 return HTMLResponse("Not found", status_code=404)
+            locked = ensure_project_mutable(project, f"/projects/{project_id}/settings")
+            if locked:
+                return locked
 
             project.display_name = display_name.strip()[:80] or project.slug
             project.dev_branch = dev_branch.strip() or DEFAULT_DEV_BRANCH
@@ -1553,6 +1825,9 @@ def update_env_settings(
             project = get_project_for_user(db, user, project_id)
             if not project:
                 return HTMLResponse("Not found", status_code=404)
+            locked = ensure_project_mutable(project, f"/projects/{project_id}/settings")
+            if locked:
+                return locked
             env = db.query(Environment).filter(Environment.id == env_id).first()
             if not env or env.project_id != project.id:
                 return redirect_with_error(f"/projects/{project_id}/settings", "Invalid environment.")
@@ -1604,6 +1879,9 @@ def connect_repo(
         project = get_project_for_user(db, user, project_id)
         if not project:
             return HTMLResponse("Not found", status_code=404)
+        locked = ensure_project_mutable(project, f"/projects/{project_id}/settings")
+        if locked:
+            return locked
 
         if not installation_id:
             # Auto-select if exactly one installation matches this user.
@@ -1658,6 +1936,9 @@ def add_domain(
         project = get_project_for_user(db, user, project_id)
         if not project:
             return HTMLResponse("Not found", status_code=404)
+        locked = ensure_project_mutable(project, f"/projects/{project_id}/settings")
+        if locked:
+            return locked
         env = db.query(Environment).filter(Environment.id == env_id).first()
         if not env or env.project_id != project.id:
             return HTMLResponse("Invalid environment", status_code=400)
@@ -1703,6 +1984,9 @@ def promote_project_env(
             project = get_project_for_user(db, user, project_id)
             if not project:
                 return HTMLResponse("Not found", status_code=404)
+            locked = ensure_project_mutable(project, f"/projects/{project_id}/settings")
+            if locked:
+                return locked
 
             envs = {e.name: e for e in project.envs}
             if source_env not in envs:
@@ -1772,6 +2056,9 @@ def reset_project_env(
             project = get_project_for_user(db, user, project_id)
             if not project:
                 return HTMLResponse("Not found", status_code=404)
+            locked = ensure_project_mutable(project, f"/projects/{project_id}/settings")
+            if locked:
+                return locked
 
             reset_env(project, env)
             set_env_status(project.id, env, "active", "")
@@ -1805,6 +2092,9 @@ def reset_project_env_from_prod(
             project = get_project_for_user(db, user, project_id)
             if not project:
                 return HTMLResponse("Not found", status_code=404)
+            locked = ensure_project_mutable(project, f"/projects/{project_id}/settings")
+            if locked:
+                return locked
 
             envs = {e.name: e for e in project.envs}
             if "prod" not in envs:
@@ -1871,6 +2161,9 @@ def create_env_manual(
         project = get_project_for_user(db, user, project_id)
         if not project:
             return HTMLResponse("Not found", status_code=404)
+        locked = ensure_project_mutable(project, f"/projects/{project_id}/settings")
+        if locked:
+            return locked
 
         env_obj = db.query(Environment).filter(
             Environment.project_id == project.id,
@@ -1916,6 +2209,9 @@ def delete_domain(request: Request, project_id: int, domain_id: int):
         project = get_project_for_user(db, user, project_id)
         if not project:
             return HTMLResponse("Not found", status_code=404)
+        locked = ensure_project_mutable(project, f"/projects/{project_id}/settings")
+        if locked:
+            return locked
         domain = db.query(Domain).filter(Domain.id == domain_id).first()
         if not domain:
             return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)

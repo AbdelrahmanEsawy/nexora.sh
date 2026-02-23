@@ -10,6 +10,23 @@
   </div>
 </div>
 
+{% if project.status == "deleting" %}
+<div class="card" style="margin-bottom:16px;">
+  <div class="project-title">Deletion In Progress</div>
+  <div class="muted" style="font-size:12px; margin-top:8px;">
+    This project is being removed in the background. Settings are temporarily locked.
+  </div>
+  <div class="spacer"></div>
+  {% for env in project.envs %}
+    {% set status = env_status.get(env.name) %}
+    <div class="row" style="justify-content: space-between; margin-bottom:8px;">
+      <span class="env-pill">{{ env.name }}</span>
+      <span class="muted" style="font-size:12px;">{{ status.message if status else "Deleting resources..." }}</span>
+    </div>
+  {% endfor %}
+</div>
+{% else %}
+
 <form class="card" method="post" action="/projects/{{ project.id }}/settings" style="margin-bottom:16px;">
   <div class="row" style="justify-content: space-between; margin-bottom:12px;">
     <div class="project-title">Identity</div>
@@ -412,4 +429,5 @@
     });
   })();
 </script>
+{% endif %}
 {% endblock %}
