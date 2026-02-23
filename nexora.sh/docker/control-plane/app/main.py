@@ -2032,11 +2032,11 @@ def promote_project_env(
     if source_env == target_env:
         return redirect_with_error(f"/projects/{project_id}/settings", "Invalid promotion.")
 
-    allowed = {("dev", "staging"), ("staging", "prod")}
+    allowed = {("dev", "staging"), ("staging", "prod"), ("dev", "prod")}
     if (source_env, target_env) not in allowed:
         return redirect_with_error(
             f"/projects/{project_id}/settings",
-            "Promotion order must be dev → staging → prod.",
+            "Promotion order must be dev → staging/prod or staging → prod.",
         )
 
     try:

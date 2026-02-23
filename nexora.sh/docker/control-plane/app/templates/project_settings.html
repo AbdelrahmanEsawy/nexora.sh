@@ -158,7 +158,7 @@
 <div class="card" style="margin-bottom:16px;">
   <div class="project-title">Environments & Domains</div>
   <div class="muted" style="font-size:12px; margin-bottom:12px;">
-    Order is Dev → Staging → Prod. Drag to promote. Dragging Staging/Prod to Dev resets Dev to empty. Pushes to the dev branch reset dev automatically.
+    Flow supports Dev → Staging/Prod, Staging → Prod, and Prod → Staging (copy). Dragging Staging/Prod to Dev resets Dev to empty. Pushes to the dev branch reset dev automatically.
   </div>
 </div>
 
@@ -221,11 +221,11 @@
               {% if dev_env or prod_env %}
                 <div class="row">
                   <select class="input" id="staging-source-{{ project.id }}">
-                    {% if dev_env %}
-                      <option value="dev">Copy from Dev</option>
-                    {% endif %}
                     {% if prod_env %}
                       <option value="prod">Copy from Prod</option>
+                    {% endif %}
+                    {% if dev_env %}
+                      <option value="dev">Copy from Dev</option>
                     {% endif %}
                   </select>
                   <button class="btn ghost" type="button" onclick="createStaging({{ project.id }})">+ Create</button>
@@ -234,14 +234,20 @@
                 <span class="muted" style="font-size:12px;">Create dev first</span>
               {% endif %}
             {% elif env_name == "prod" and not env %}
-              {% if staging_env %}
-                <form method="post" action="/projects/{{ project.id }}/promote">
-                  <input type="hidden" name="source_env" value="staging" />
-                  <input type="hidden" name="target_env" value="prod" />
-                  <button class="btn ghost" type="submit">Create from Staging</button>
-                </form>
+              {% if staging_env or dev_env %}
+                <div class="row">
+                  <select class="input" id="prod-source-{{ project.id }}">
+                    {% if staging_env %}
+                      <option value="staging">Create from Staging</option>
+                    {% endif %}
+                    {% if dev_env %}
+                      <option value="dev">Create from Dev</option>
+                    {% endif %}
+                  </select>
+                  <button class="btn ghost" type="button" onclick="createProd({{ project.id }})">+ Create</button>
+                </div>
               {% else %}
-                <span class="muted" style="font-size:12px;">Create staging first</span>
+                <span class="muted" style="font-size:12px;">Create dev first</span>
               {% endif %}
             {% endif %}
             {% if env_name == "dev" and not env %}
@@ -358,6 +364,16 @@
       }
     };
 
+    window.createProd = function (projectId) {
+      const select = document.getElementById(`prod-source-${projectId}`);
+      if (!select) return;
+      const source = select.value;
+      const label = source === "staging" ? "Staging" : "Dev";
+      if (confirm(`Create Prod from ${label}?`)) {
+        postAction(`/projects/${projectId}/promote`, { source_env: source, target_env: "prod" });
+      }
+    };
+
     function handleDrop(sourceEnv, targetEnv, projectId) {
       if (!sourceEnv || !targetEnv || sourceEnv === targetEnv) {
         return;
@@ -377,6 +393,12 @@
         }
         return;
       }
+      if (sourceEnv === "dev" && targetEnv === "prod") {
+        if (confirm("Promote Dev → Prod?")) {
+          postAction(promoteUrl, { source_env: "dev", target_env: "prod" });
+        }
+        return;
+      }
       if (targetEnv === "dev" && (sourceEnv === "prod" || sourceEnv === "staging")) {
         if (confirm("Reset Dev to empty? This wipes the dev database and filestore.")) {
           postAction(resetDevUrl, { env: "dev" });
@@ -389,7 +411,7 @@
         }
         return;
       }
-      alert("Allowed: dev → staging, staging → prod, prod → staging (copy), staging/prod → dev (reset empty).");
+      alert("Allowed: dev → staging/prod, staging → prod, prod → staging (copy), staging/prod → dev (reset empty).");
     }
 
     cards.forEach((card) => {
