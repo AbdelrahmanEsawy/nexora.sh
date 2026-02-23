@@ -435,6 +435,15 @@ def restart_env(slug: str, env: str):
     )
 
 
+def scale_env(slug: str, env: str, replicas: int):
+    name = f"odoo-{slug}-{env}"
+    run_kubectl(
+        ["scale", "deployment", name, f"--replicas={max(0, int(replicas))}"],
+        namespace=ODOO_NAMESPACE,
+        timeout=KUBECTL_MUTATE_TIMEOUT,
+    )
+
+
 def db_session():
     return SessionLocal()
 
@@ -781,6 +790,17 @@ def env_runtime_status(project: Project, env_name: str) -> dict:
         phase = pvc.get("status", {}).get("phase")
         if phase == "Pending":
             return {"ready": False, "message": "Storage pending"}
+
+    job_status = init_job_status(project.slug, env_name)
+    if job_status:
+        if job_status.get("failed", 0) > 0:
+            reason = (job_status.get("reason") or "").strip()
+            if reason:
+                return {"ready": False, "message": f"Init failed: {reason}"}
+            return {"ready": False, "message": "Init failed"}
+        if job_status.get("active", 0) > 0:
+            return {"ready": False, "message": "Initializing database"}
+
     pod_issue = odoo_pod_issue(project.slug, env_name)
     if pod_issue:
         return {"ready": False, "message": f"Pod issue: {pod_issue}"}
@@ -847,7 +867,19 @@ def ensure_odoo_init(
     job_name = init_job_name(slug, env)
     status = init_job_status(slug, env)
     if status:
-        if status.get("succeeded", 0) > 0 or status.get("active", 0) > 0:
+        if status.get("active", 0) > 0:
+            # Keep runtime deployment scaled down while init job holds the PVC.
+            try:
+                scale_env(slug, env, 0)
+            except Exception:
+                pass
+            return
+        if status.get("succeeded", 0) > 0:
+            # Init is done; ensure runtime deployment is allowed to start.
+            try:
+                scale_env(slug, env, 1)
+            except Exception:
+                pass
             return
         if status.get("failed", 0) > 0:
             if not restart_failed:
@@ -908,6 +940,11 @@ spec:
             secretName: {cfg_secret}
 """.strip() + "\n"
 
+    # Avoid PVC multi-attach with runtime pod during DB bootstrap.
+    try:
+        scale_env(slug, env, 0)
+    except Exception:
+        pass
     kubectl_apply(manifest)
 
 
