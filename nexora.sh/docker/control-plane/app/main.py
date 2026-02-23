@@ -1080,6 +1080,8 @@ metadata:
     env: {env}
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: odoo
