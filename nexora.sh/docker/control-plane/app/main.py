@@ -690,11 +690,12 @@ def tls_secret_ready(secret_name: str) -> bool:
     return bool(data.get("tls.crt") and data.get("tls.key"))
 
 
-def service_has_ready_endpoints(slug: str, env_name: str) -> bool:
+def service_has_ready_endpoints(slug: str, env_name: str) -> Optional[bool]:
     svc_name = f"odoo-{slug}-{env_name}"
     endpoints = kubectl_get_json(ODOO_NAMESPACE, "endpoints", svc_name)
     if not endpoints:
-        return False
+        # Unknown (RBAC/API hiccup): let other checks decide readiness.
+        return None
     for subset in endpoints.get("subsets") or []:
         if subset.get("addresses"):
             return True
@@ -703,6 +704,9 @@ def service_has_ready_endpoints(slug: str, env_name: str) -> bool:
 
 def odoo_pod_issue(slug: str, env_name: str) -> str:
     pods = kubectl_get_list_json(ODOO_NAMESPACE, "pods", f"app=odoo,project={slug},env={env_name}")
+    if not pods:
+        # Unknown (RBAC/API hiccup): do not force a false negative status.
+        return ""
     items = (pods or {}).get("items") or []
     if not items:
         return "Pod not scheduled yet"
@@ -754,7 +758,8 @@ def env_runtime_status(project: Project, env_name: str) -> dict:
     replicas = int(status.get("replicas") or 0)
     ready = int(status.get("readyReplicas") or 0)
     if replicas and ready >= replicas:
-        if not service_has_ready_endpoints(project.slug, env_name):
+        endpoints_ready = service_has_ready_endpoints(project.slug, env_name)
+        if endpoints_ready is False:
             return {"ready": False, "message": "Service endpoints not ready"}
 
         job_status = init_job_status(project.slug, env_name)
