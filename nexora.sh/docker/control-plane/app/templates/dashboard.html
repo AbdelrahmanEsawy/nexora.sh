@@ -266,7 +266,7 @@
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
         await fetch(probeUrl, {
-          method: 'GET',
+          method: 'HEAD',
           mode: 'no-cors',
           cache: 'no-store',
           credentials: 'omit',
@@ -282,12 +282,13 @@
 
     async function measurePing(url) {
       const samples = [
-        await probeOnce(url, 4500),
-        await probeOnce(url, 4500),
-        await probeOnce(url, 4500),
+        await probeOnce(url, 2200),
+        await probeOnce(url, 2200),
+        await probeOnce(url, 2200),
       ].filter((value) => typeof value === 'number');
       if (!samples.length) return null;
-      return Math.round(samples.reduce((sum, value) => sum + value, 0) / samples.length);
+      const sorted = samples.slice().sort((left, right) => left - right);
+      return Math.round(sorted[Math.floor(sorted.length / 2)]);
     }
 
     async function loadCapacity() {
@@ -334,6 +335,7 @@
       manualSelection = true;
     }
 
+    const pingPromiseByUrl = Object.create(null);
     Promise.all(cards.map(async (card) => {
       const code = card.dataset.location || '';
       const probeUrl = card.dataset.probeUrl || '';
@@ -342,7 +344,10 @@
         pingState[code] = null;
         return;
       }
-      const ping = await measurePing(probeUrl);
+      if (!pingPromiseByUrl[probeUrl]) {
+        pingPromiseByUrl[probeUrl] = measurePing(probeUrl);
+      }
+      const ping = await pingPromiseByUrl[probeUrl];
       pingState[code] = ping;
     })).then(async () => {
       setProbePayload();
