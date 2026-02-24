@@ -1659,9 +1659,12 @@ def env_runtime_status(project: Project, env_name: str) -> dict:
     return {"ready": False, "message": "Starting"}
 
 
-def kubectl_delete(kind: str, name: str):
+def kubectl_delete(kind: str, name: str, *, wait: bool = True):
+    args = ["delete", kind, name, "--ignore-not-found"]
+    if not wait:
+        args.append("--wait=false")
     run_kubectl(
-        ["delete", kind, name, "--ignore-not-found"],
+        args,
         namespace=ODOO_NAMESPACE,
         timeout=KUBECTL_MUTATE_TIMEOUT,
     )
@@ -2121,13 +2124,13 @@ def delete_env(slug: str, env: str, domain_hosts: Optional[list[str]] = None):
 
     for host in sorted(all_domain_hosts):
         ingress_name = ingress_name_for_domain(name, host)
-        kubectl_delete("ingress", ingress_name)
+        kubectl_delete("ingress", ingress_name, wait=False)
 
-    kubectl_delete("ingress", name)
-    kubectl_delete("service", name)
-    kubectl_delete("deployment", name)
-    kubectl_delete("secret", cfg_secret)
-    kubectl_delete("pvc", pvc_name)
+    kubectl_delete("ingress", name, wait=False)
+    kubectl_delete("service", name, wait=False)
+    kubectl_delete("deployment", name, wait=False)
+    kubectl_delete("secret", cfg_secret, wait=False)
+    kubectl_delete("pvc", pvc_name, wait=False)
 
     drop_db(db_name_for(slug, env))
 
