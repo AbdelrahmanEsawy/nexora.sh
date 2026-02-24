@@ -878,9 +878,31 @@ def hosting_catalog(force: bool = False) -> tuple[list[dict], dict, dict]:
 
 
 def env_logs_tail(slug: str, env_name: str, lines: int = 200) -> str:
-    deploy_name = f"odoo-{slug}-{env_name}"
+    label = f"app=odoo,project={slug},env={env_name}"
+    pod_lookup = run_kubectl(
+        ["get", "pods", "-l", label, "--sort-by=.metadata.creationTimestamp", "-o", "name"],
+        namespace=ODOO_NAMESPACE,
+        timeout=max(KUBECTL_GET_TIMEOUT, 12),
+    )
+    lookup_err = (pod_lookup.stderr or b"").decode("utf-8", errors="replace").strip()
+    if pod_lookup.returncode != 0:
+        if "forbidden" in lookup_err.lower():
+            return "Logs permission is missing (RBAC). Apply updated control-plane RBAC and retry."
+        if lookup_err:
+            return f"Unable to fetch logs: {lookup_err}"
+        return "Unable to fetch logs."
+
+    pod_lines = [
+        line.strip()
+        for line in (pod_lookup.stdout or b"").decode("utf-8", errors="replace").splitlines()
+        if line.strip().startswith("pod/")
+    ]
+    if not pod_lines:
+        return f"No runtime pod yet for {env_name}. Environment is still provisioning."
+    pod_name = pod_lines[-1].split("/", 1)[1]
+
     result = run_kubectl(
-        ["logs", f"deployment/{deploy_name}", f"--tail={max(20, min(lines, 1000))}"],
+        ["logs", f"pod/{pod_name}", f"--tail={max(20, min(lines, 1000))}"],
         namespace=ODOO_NAMESPACE,
         timeout=max(KUBECTL_GET_TIMEOUT, 12),
     )
@@ -888,7 +910,9 @@ def env_logs_tail(slug: str, env_name: str, lines: int = 200) -> str:
     stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
     if result.returncode != 0:
         if "NotFound" in stderr:
-            return f"No deployment found for {env_name} yet."
+            return f"No runtime pod found for {env_name} yet."
+        if "forbidden" in stderr.lower():
+            return "Logs permission is missing (RBAC). Apply updated control-plane RBAC and retry."
         if stderr:
             return f"Unable to fetch logs: {stderr}"
         return "Unable to fetch logs."
@@ -2193,14 +2217,43 @@ def spawn_env_provision(project_id: int, env_name: str):
                 ).first()
                 if not env_obj:
                     return
+                db.add(
+                    BuildEvent(
+                        project_id=project.id,
+                        env=env_name,
+                        branch="",
+                        sha="",
+                        status="provisioning",
+                        message=f"Provisioning {env_name} environment",
+                    )
+                )
+                db.commit()
                 host, db_name = provision_env(project, env_name, env_obj)
                 env_obj.host = host
                 env_obj.db_name = db_name
                 env_obj.status = "active"
                 env_obj.last_error = ""
+                db.add(
+                    BuildEvent(
+                        project_id=project.id,
+                        env=env_name,
+                        branch="",
+                        sha="",
+                        status="active",
+                        message=f"{env_name} environment is active",
+                    )
+                )
                 db.commit()
         except Exception as exc:
             set_env_status(project_id, env_name, "failed", str(exc))
+            record_build_event(
+                project_id,
+                env_name,
+                "",
+                "",
+                "failed",
+                f"{env_name} provisioning failed: {str(exc)[:180]}",
+            )
 
     thread = threading.Thread(target=_worker, daemon=True)
     thread.start()
@@ -2583,6 +2636,14 @@ def create_project(
         db.commit()
         created_project_id = project.id
 
+    record_build_event(
+        created_project_id,
+        "dev",
+        "",
+        "",
+        "queued",
+        "Project created. Dev provisioning queued.",
+    )
     spawn_env_provision(created_project_id, "dev")
     if fallback_notice:
         return RedirectResponse(
@@ -2732,6 +2793,45 @@ def project_settings(request: Request, project_id: int):
             for build in recent_builds
             if (build.env or "").strip() in {"", selected_env}
         ]
+        if selected_env_obj and not branch_history:
+            runtime_msg = (env_status.get(selected_env) or {}).get("message") or ""
+            seed_status = (selected_env_obj.status or "active").strip().lower() or "active"
+            seed_message = runtime_msg
+            if not seed_message:
+                if seed_status == "failed" and selected_env_obj.last_error:
+                    seed_message = selected_env_obj.last_error
+                else:
+                    seed_message = f"{selected_env} environment state: {seed_status}"
+            last_env_event = (
+                db.query(BuildEvent)
+                .filter(BuildEvent.project_id == project.id, BuildEvent.env == selected_env)
+                .order_by(BuildEvent.created_at.desc(), BuildEvent.id.desc())
+                .first()
+            )
+            if not last_env_event:
+                db.add(
+                    BuildEvent(
+                        project_id=project.id,
+                        env=selected_env,
+                        branch="",
+                        sha="",
+                        status=seed_status,
+                        message=seed_message[:500],
+                    )
+                )
+                db.commit()
+                recent_builds = (
+                    db.query(BuildEvent)
+                    .filter(BuildEvent.project_id == project.id)
+                    .order_by(BuildEvent.created_at.desc())
+                    .limit(60)
+                    .all()
+                )
+                branch_history = [
+                    build
+                    for build in recent_builds
+                    if (build.env or "").strip() in {"", selected_env}
+                ]
         branch_logs = ""
         if selected_tab == "logs":
             if selected_env_obj:
