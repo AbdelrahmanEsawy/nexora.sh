@@ -107,9 +107,9 @@
       <div class="row" style="justify-content: space-between; margin-bottom:6px;">
         <span class="env-pill">{{ env_name }}</span>
         {% if env %}
-          <a class="btn {% if project.status == 'deleting' %}disabled{% endif %}" href="/projects/{{ project.id }}/env/{{ env_name }}/open">Open</a>
+          <a class="btn {% if project.status in ['deleting', 'delete_failed'] %}disabled{% endif %}" href="/projects/{{ project.id }}/env/{{ env_name }}/open">Open</a>
         {% else %}
-          <a class="btn ghost {% if project.status == 'deleting' %}disabled{% endif %}" href="/projects/{{ project.id }}/settings">Create</a>
+          <a class="btn ghost {% if project.status in ['deleting', 'delete_failed'] %}disabled{% endif %}" href="/projects/{{ project.id }}/settings">Create</a>
         {% endif %}
       </div>
       {% if env %}

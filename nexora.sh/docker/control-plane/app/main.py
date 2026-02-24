@@ -2163,6 +2163,10 @@ def set_project_status(project_id: int, status: str, error: str = ""):
 
 
 def spawn_project_delete(project_id: int):
+    def _is_pvc_cleanup_timeout(err: str) -> bool:
+        text_value = (err or "").strip().lower()
+        return "kubectl timed out" in text_value and " delete pvc " in text_value
+
     def _worker():
         try:
             with db_session() as db:
@@ -2171,11 +2175,15 @@ def spawn_project_delete(project_id: int):
                     return
                 slug = project.slug
                 env_names = [env.name for env in project.envs]
+                env_domains = {
+                    env.name: [domain.host for domain in env.domains]
+                    for env in list(project.envs)
+                }
 
             errors = []
             for env_name in env_names:
                 try:
-                    delete_env(slug, env_name)
+                    delete_env(slug, env_name, env_domains.get(env_name) or [])
                 except Exception as exc:
                     errors.append(f"{env_name}: {str(exc)[:120]}")
 
@@ -2184,6 +2192,12 @@ def spawn_project_delete(project_id: int):
                 if not project:
                     return
                 if errors:
+                    if all(_is_pvc_cleanup_timeout(err) for err in errors):
+                        # PVC detach can exceed request timeout. Remove from dashboard and keep best-effort cleanup.
+                        db.delete(project)
+                        db.commit()
+                        spawn_orphan_cleanup(slug, env_domains)
+                        return
                     project.status = "delete_failed"
                     project.last_error = "; ".join(errors)[:500]
                     db.commit()
