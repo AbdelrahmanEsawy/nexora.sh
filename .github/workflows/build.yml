@@ -32,7 +32,9 @@ jobs:
           context: ./nexora.sh/docker/control-plane
           file: ./nexora.sh/docker/control-plane/Dockerfile
           push: true
-          tags: ghcr.io/abdelrahmanesawy/nexora-control-plane:latest
+          tags: |
+            ghcr.io/abdelrahmanesawy/nexora-control-plane:latest
+            ghcr.io/abdelrahmanesawy/nexora-control-plane:sha-${{ github.sha }}
 
       - name: Set package visibility to public
         run: |

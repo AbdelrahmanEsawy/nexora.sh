@@ -14,8 +14,6 @@ spec:
         app: nexora-control-plane
     spec:
       serviceAccountName: nexora-control-plane
-      imagePullSecrets:
-        - name: ghcr-credentials
       containers:
         - name: control-plane
           image: ghcr.io/abdelrahmanesawy/nexora-control-plane:latest
@@ -141,6 +139,14 @@ spec:
                 secretKeyRef:
                   name: nexora-db
                   key: sslmode
+            - name: CONTROL_PLANE_DB_NAME
+              value: nexora_control_plane
+            - name: CONTROL_PLANE_RECONCILE_TTL
+              value: "45"
+            - name: MAX_BUILD_EVENTS_PER_PROJECT
+              value: "800"
+            - name: BUILD_EVENT_RETENTION_DAYS
+              value: "120"
             - name: OVH_ENDPOINT
               valueFrom:
                 secretKeyRef:

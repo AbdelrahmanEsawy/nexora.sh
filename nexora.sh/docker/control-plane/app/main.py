@@ -3,11 +3,10 @@ import hmac
 import json
 import os
 import re
-import sqlite3
 import subprocess
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 from urllib.parse import quote, urlencode
 
@@ -19,7 +18,7 @@ from authlib.integrations.base_client.errors import MismatchingStateError
 from fastapi import FastAPI, Form, Request, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, create_engine, text
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, create_engine, inspect, text
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from starlette.middleware.sessions import SessionMiddleware
 import jwt
@@ -37,6 +36,8 @@ DB_PORT = os.getenv("DB_PORT", "5432")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_SSLMODE = os.getenv("DB_SSLMODE", "require")
+CONTROL_PLANE_DATABASE_URL = os.getenv("CONTROL_PLANE_DATABASE_URL", "").strip()
+CONTROL_PLANE_DB_NAME = os.getenv("CONTROL_PLANE_DB_NAME", "nexora_control_plane").strip()
 
 APP_SECRET = os.getenv("APP_SECRET", "change-me")
 
@@ -66,6 +67,9 @@ OVH_APPLICATION_SECRET = os.getenv("OVH_APPLICATION_SECRET", "").strip()
 OVH_CONSUMER_KEY = os.getenv("OVH_CONSUMER_KEY", "").strip()
 OVH_API_TIMEOUT = int(os.getenv("OVH_API_TIMEOUT", "12"))
 OVH_QUOTA_CACHE_TTL = max(5, int(os.getenv("OVH_QUOTA_CACHE_TTL", "30")))
+CONTROL_PLANE_RECONCILE_TTL = max(10, int(os.getenv("CONTROL_PLANE_RECONCILE_TTL", "45")))
+MAX_BUILD_EVENTS_PER_PROJECT = max(100, int(os.getenv("MAX_BUILD_EVENTS_PER_PROJECT", "800")))
+BUILD_EVENT_RETENTION_DAYS = max(7, int(os.getenv("BUILD_EVENT_RETENTION_DAYS", "120")))
 
 DEFAULT_HOSTING_LOCATIONS = [
     {"code": "uk1", "label": "London (UK1)", "region": "Europe", "ovh_region": "UK1"},
@@ -158,9 +162,88 @@ MASTER_ADMIN_EMAILS = {
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 DB_PATH = os.path.join(DATA_DIR, "nexora.db")
 
-engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
+if not CONTROL_PLANE_DB_NAME:
+    CONTROL_PLANE_DB_NAME = "nexora_control_plane"
+CONTROL_PLANE_DB_NAME = re.sub(r"[^a-zA-Z0-9_]", "_", CONTROL_PLANE_DB_NAME)
+
+
+def derived_control_plane_database_url() -> tuple[str, bool]:
+    if CONTROL_PLANE_DATABASE_URL:
+        return CONTROL_PLANE_DATABASE_URL, False
+    if DB_HOST and DB_USER and DB_PASSWORD:
+        user = quote(DB_USER, safe="")
+        password = quote(DB_PASSWORD, safe="")
+        sslmode = quote(DB_SSLMODE, safe="")
+        db_name = quote(CONTROL_PLANE_DB_NAME, safe="")
+        return (
+            f"postgresql+psycopg2://{user}:{password}@{DB_HOST}:{DB_PORT}/{db_name}?sslmode={sslmode}",
+            True,
+        )
+    return f"sqlite:///{DB_PATH}", False
+
+
+def ensure_control_plane_postgres_database():
+    conn = psycopg2.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        dbname="postgres",
+        sslmode=DB_SSLMODE,
+        connect_timeout=DB_CONNECT_TIMEOUT,
+        options=f"-c statement_timeout={DB_STATEMENT_TIMEOUT_MS}",
+    )
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM pg_database WHERE datname = %s",
+            (CONTROL_PLANE_DB_NAME,),
+        )
+        exists = cur.fetchone() is not None
+        if not exists:
+            cur.execute(
+                sql.SQL("CREATE DATABASE {} OWNER {};").format(
+                    sql.Identifier(CONTROL_PLANE_DB_NAME),
+                    sql.Identifier(DB_USER),
+                )
+            )
+    conn.close()
+
+
+SQLALCHEMY_DATABASE_URL, DERIVED_CP_DB_FROM_OVH_POSTGRES = derived_control_plane_database_url()
+CONTROL_PLANE_DB_BOOT_ERROR = ""
+if DERIVED_CP_DB_FROM_OVH_POSTGRES:
+    try:
+        ensure_control_plane_postgres_database()
+    except Exception as exc:
+        CONTROL_PLANE_DB_BOOT_ERROR = str(exc)[:220]
+        SQLALCHEMY_DATABASE_URL = f"sqlite:///{DB_PATH}"
+        DERIVED_CP_DB_FROM_OVH_POSTGRES = False
+
+IS_SQLITE = SQLALCHEMY_DATABASE_URL.startswith("sqlite:")
+if IS_SQLITE:
+    engine = create_engine(
+        SQLALCHEMY_DATABASE_URL,
+        connect_args={"check_same_thread": False},
+    )
+else:
+    engine = create_engine(
+        SQLALCHEMY_DATABASE_URL,
+        pool_pre_ping=True,
+        pool_recycle=300,
+    )
+
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
+
+PROJECT_RECONCILE_STATE = {
+    "fetched_at": 0.0,
+    "error": "",
+    "imported_projects": 0,
+    "imported_envs": 0,
+    "imported_domains": 0,
+}
+PROJECT_RECONCILE_LOCK = threading.Lock()
 
 
 class User(Base):
@@ -264,7 +347,8 @@ Base.metadata.create_all(engine)
 
 def ensure_schema():
     with engine.begin() as conn:
-        user_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(users)"))}
+        inspector = inspect(conn)
+        user_cols = {col["name"] for col in inspector.get_columns("users")}
         for name, ddl in [
             ("email", "email TEXT"),
             ("is_admin", "is_admin BOOLEAN"),
@@ -272,7 +356,8 @@ def ensure_schema():
             if name not in user_cols:
                 conn.execute(text(f"ALTER TABLE users ADD COLUMN {ddl}"))
 
-        cols = {row[1] for row in conn.execute(text("PRAGMA table_info(projects)"))}
+        inspector = inspect(conn)
+        cols = {col["name"] for col in inspector.get_columns("projects")}
         for name, ddl in [
             ("display_name", "display_name TEXT"),
             ("dev_branch", "dev_branch TEXT"),
@@ -328,7 +413,8 @@ def ensure_schema():
             {"v": "active"},
         )
 
-        env_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(environments)"))}
+        inspector = inspect(conn)
+        env_cols = {col["name"] for col in inspector.get_columns("environments")}
         for name, ddl in [
             ("workers", "workers INTEGER"),
             ("storage_gb", "storage_gb INTEGER"),
@@ -355,6 +441,11 @@ def ensure_schema():
             text("UPDATE environments SET status = :v WHERE status IS NULL"),
             {"v": "active"},
         )
+        cutoff = datetime.utcnow() - timedelta(days=BUILD_EVENT_RETENTION_DAYS)
+        conn.execute(
+            text("DELETE FROM build_events WHERE created_at < :cutoff"),
+            {"cutoff": cutoff},
+        )
 
 
 ensure_schema()
@@ -364,15 +455,20 @@ app = FastAPI()
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    payload = {
+        "status": "ok",
+        "control_plane_db": "sqlite" if IS_SQLITE else "postgres",
+    }
+    if CONTROL_PLANE_DB_BOOT_ERROR:
+        payload["warning"] = f"control-plane DB fallback: {CONTROL_PLANE_DB_BOOT_ERROR}"
+    return payload
 
 
 @app.get("/ready")
 def ready():
     try:
-        conn = sqlite3.connect(DB_PATH, timeout=1)
-        conn.execute("SELECT 1")
-        conn.close()
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
     except Exception:
         raise HTTPException(status_code=503, detail="storage unavailable")
     return {"status": "ready"}
@@ -942,6 +1038,19 @@ def record_build_event(project_id: int, env: str, branch: str, sha: str, status:
                 message=message,
             )
         )
+        cutoff = datetime.utcnow() - timedelta(days=BUILD_EVENT_RETENTION_DAYS)
+        db.query(BuildEvent).filter(BuildEvent.created_at < cutoff).delete(synchronize_session=False)
+        overflow = (
+            db.query(BuildEvent.id)
+            .filter(BuildEvent.project_id == project_id)
+            .order_by(BuildEvent.created_at.desc(), BuildEvent.id.desc())
+            .offset(MAX_BUILD_EVENTS_PER_PROJECT)
+            .all()
+        )
+        if overflow:
+            db.query(BuildEvent).filter(
+                BuildEvent.id.in_([row[0] for row in overflow if row and row[0]])
+            ).delete(synchronize_session=False)
         db.commit()
 
 
@@ -1226,6 +1335,170 @@ def kubectl_get_json(namespace: str, kind: str, name: str) -> Optional[dict]:
         return json.loads(proc.stdout.decode("utf-8"))
     except Exception:
         return None
+
+
+def k8s_project_env(meta: dict) -> tuple[str, str]:
+    labels = (meta.get("labels") or {}) if isinstance(meta, dict) else {}
+    slug = str(labels.get("project") or "").strip().lower()
+    env = str(labels.get("env") or "").strip().lower()
+    name = str(meta.get("name") or "").strip().lower() if isinstance(meta, dict) else ""
+
+    if (not slug or not env) and name:
+        m = re.match(r"^odoo-([a-z0-9-]+)-(dev|staging|prod)$", name)
+        if m:
+            slug = m.group(1)
+            env = m.group(2)
+
+    if env not in {"dev", "staging", "prod"}:
+        return "", ""
+    if not SLUG_RE.match(slug):
+        return "", ""
+    return slug, env
+
+
+def discover_cluster_projects() -> dict[str, dict[str, dict]]:
+    projects: dict[str, dict[str, dict]] = {}
+
+    deployments = kubectl_get_list_json(ODOO_NAMESPACE, "deployments", "app=odoo") or {}
+    for item in deployments.get("items") or []:
+        meta = item.get("metadata") or {}
+        slug, env = k8s_project_env(meta)
+        if not slug or not env:
+            continue
+        projects.setdefault(slug, {})
+        projects[slug].setdefault(env, {"host": host_for(slug, env), "domains": set()})
+
+    ingresses = kubectl_get_list_json(ODOO_NAMESPACE, "ingresses", "app=odoo") or {}
+    for item in ingresses.get("items") or []:
+        meta = item.get("metadata") or {}
+        slug, env = k8s_project_env(meta)
+        if not slug or not env:
+            continue
+        env_entry = projects.setdefault(slug, {}).setdefault(
+            env,
+            {"host": host_for(slug, env), "domains": set()},
+        )
+        rules = ((item.get("spec") or {}).get("rules") or [])
+        for rule in rules:
+            host = str((rule or {}).get("host") or "").strip().lower()
+            if host:
+                env_entry["domains"].add(host)
+
+    for slug, envs in projects.items():
+        for env, info in envs.items():
+            domains = {d for d in info.get("domains", set()) if d}
+            default_host = host_for(slug, env)
+            chosen = default_host
+            if default_host not in domains and domains:
+                same_base = sorted([d for d in domains if d.endswith(f".{BASE_DOMAIN}")])
+                chosen = same_base[0] if same_base else sorted(domains)[0]
+            info["host"] = chosen
+            domains.add(chosen)
+            info["domains"] = sorted(domains)
+
+    return projects
+
+
+def reconcile_projects_from_cluster(owner_id: int) -> dict:
+    discovered = discover_cluster_projects()
+    if not discovered:
+        return {"projects": 0, "envs": 0, "domains": 0}
+
+    imported_projects = 0
+    imported_envs = 0
+    imported_domains = 0
+
+    with db_session() as db:
+        existing = {p.slug: p for p in db.query(Project).all()}
+        for slug, env_map in discovered.items():
+            project = existing.get(slug)
+            if not project:
+                project = Project(
+                    slug=slug,
+                    display_name=slug,
+                    dev_branch=DEFAULT_DEV_BRANCH,
+                    staging_branch=DEFAULT_STAGING_BRANCH,
+                    prod_branch=DEFAULT_PROD_BRANCH,
+                    workers=DEFAULT_WORKERS,
+                    storage_gb=DEFAULT_STORAGE_GB,
+                    staging_slots=DEFAULT_STAGING_SLOTS,
+                    odoo_version=DEFAULT_ODOO_VERSION,
+                    status="active",
+                    owner_id=owner_id,
+                )
+                db.add(project)
+                db.flush()
+                imported_projects += 1
+                existing[slug] = project
+
+            env_by_name = {env.name: env for env in project.envs}
+            for env_name, env_info in env_map.items():
+                env_host = str(env_info.get("host") or host_for(slug, env_name)).strip().lower()
+                env_obj = env_by_name.get(env_name)
+                if not env_obj:
+                    env_obj = Environment(
+                        project_id=project.id,
+                        name=env_name,
+                        host=env_host,
+                        db_name=db_name_for(slug, env_name),
+                        workers=project.workers or DEFAULT_WORKERS,
+                        storage_gb=project.storage_gb or DEFAULT_STORAGE_GB,
+                        odoo_version=project.odoo_version or DEFAULT_ODOO_VERSION,
+                        status="active",
+                        last_error="",
+                    )
+                    db.add(env_obj)
+                    db.flush()
+                    imported_envs += 1
+                    env_by_name[env_name] = env_obj
+                else:
+                    if not env_obj.host:
+                        env_obj.host = env_host
+                    if not env_obj.db_name:
+                        env_obj.db_name = db_name_for(slug, env_name)
+                    if not env_obj.status:
+                        env_obj.status = "active"
+
+                seen_hosts = {d.host for d in env_obj.domains}
+                for host in env_info.get("domains", []):
+                    if host in seen_hosts:
+                        continue
+                    if db.query(Domain).filter(Domain.host == host).first():
+                        continue
+                    db.add(Domain(env_id=env_obj.id, host=host))
+                    imported_domains += 1
+
+        if imported_projects or imported_envs or imported_domains:
+            db.commit()
+
+    return {
+        "projects": imported_projects,
+        "envs": imported_envs,
+        "domains": imported_domains,
+    }
+
+
+def maybe_reconcile_cluster_projects(user: User):
+    if not user or not user.is_admin:
+        return
+    now = time.time()
+    if (now - float(PROJECT_RECONCILE_STATE.get("fetched_at") or 0.0)) < CONTROL_PLANE_RECONCILE_TTL:
+        return
+
+    with PROJECT_RECONCILE_LOCK:
+        now = time.time()
+        if (now - float(PROJECT_RECONCILE_STATE.get("fetched_at") or 0.0)) < CONTROL_PLANE_RECONCILE_TTL:
+            return
+        try:
+            result = reconcile_projects_from_cluster(user.id)
+            PROJECT_RECONCILE_STATE["error"] = ""
+            PROJECT_RECONCILE_STATE["imported_projects"] = result["projects"]
+            PROJECT_RECONCILE_STATE["imported_envs"] = result["envs"]
+            PROJECT_RECONCILE_STATE["imported_domains"] = result["domains"]
+        except Exception as exc:
+            PROJECT_RECONCILE_STATE["error"] = str(exc)[:220]
+        finally:
+            PROJECT_RECONCILE_STATE["fetched_at"] = time.time()
 
 
 def tls_secret_name(slug: str, env_name: str) -> str:
@@ -1938,6 +2211,7 @@ def index(request: Request):
     user = current_user(request)
     if not user:
         return RedirectResponse("/login")
+    maybe_reconcile_cluster_projects(user)
 
     error = request.query_params.get("error")
     notice = request.query_params.get("notice")
@@ -2366,6 +2640,8 @@ def project_settings(request: Request, project_id: int):
     user = current_user(request)
     if not user:
         return RedirectResponse("/login")
+    if user.is_admin:
+        maybe_reconcile_cluster_projects(user)
     error = request.query_params.get("error")
     notice = request.query_params.get("notice")
     selected_env = (request.query_params.get("env") or "").strip().lower()
