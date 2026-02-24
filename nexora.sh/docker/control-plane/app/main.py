@@ -27,7 +27,6 @@ BASE_DOMAIN = os.getenv("BASE_DOMAIN", "nexora.red")
 ODOO_NAMESPACE = os.getenv("ODOO_NAMESPACE", "odoo-system")
 ODOO_IMAGE = os.getenv("ODOO_IMAGE", "odoo:19")
 ODOO_ADMIN_PASSWD = os.getenv("ODOO_ADMIN_PASSWD")
-ADMIN_GITHUB = os.getenv("ADMIN_GITHUB", "").lower()
 MASTER_ADMIN_EMAIL = os.getenv("MASTER_ADMIN_EMAIL", "").strip().lower()
 MASTER_ADMIN_EMAILS_RAW = os.getenv("MASTER_ADMIN_EMAILS", "admin@nexora.red").strip().lower()
 
@@ -959,11 +958,8 @@ def verify_github_signature(secret: str, body: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
-def is_master_admin_user(username: str, email: str) -> bool:
-    login = (username or "").strip().lower()
+def is_master_admin_user(email: str) -> bool:
     mail = (email or "").strip().lower()
-    if login and login == ADMIN_GITHUB:
-        return True
     if mail and mail in MASTER_ADMIN_EMAILS:
         return True
     return False
@@ -1136,7 +1132,15 @@ def current_user(request: Request) -> Optional[User]:
     if not user_id:
         return None
     with db_session() as db:
-        return db.query(User).filter(User.id == user_id).first()
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            return None
+        should_be_admin = is_master_admin_user(user.email)
+        if bool(user.is_admin) != bool(should_be_admin):
+            user.is_admin = bool(should_be_admin)
+            db.commit()
+            db.refresh(user)
+        return user
 
 
 def ensure_prereqs():
@@ -2385,7 +2389,7 @@ async def auth_callback(request: Request):
     email = await github_primary_email(token, profile)
     if not username or not github_id:
         return HTMLResponse("GitHub login failed", status_code=400)
-    admin_match = is_master_admin_user(username, email)
+    admin_match = is_master_admin_user(email)
 
     with db_session() as db:
         user = db.query(User).filter(User.github_id == github_id).first()
@@ -2405,8 +2409,7 @@ async def auth_callback(request: Request):
             user.name = name
             if email:
                 user.email = email
-            if admin_match:
-                user.is_admin = True
+            user.is_admin = bool(admin_match)
             db.commit()
             db.refresh(user)
         request.session["user_id"] = user.id
