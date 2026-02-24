@@ -2267,7 +2267,18 @@ def hosting_availability(request: Request):
 def login(request: Request):
     if current_user(request):
         return RedirectResponse("/")
-    return templates.TemplateResponse("login.html", {"request": request})
+    error = request.query_params.get("error")
+    notice = request.query_params.get("notice")
+    oauth_ready = bool(GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET and hasattr(oauth, "github"))
+    return templates.TemplateResponse(
+        "login.html",
+        {
+            "request": request,
+            "error": error,
+            "notice": notice,
+            "oauth_ready": oauth_ready,
+        },
+    )
 
 
 @app.get("/logout")
@@ -2283,12 +2294,20 @@ def github_install(request: Request):
 
 @app.get("/auth/github")
 async def auth_github(request: Request):
+    if not GITHUB_CLIENT_ID or not GITHUB_CLIENT_SECRET:
+        return redirect_with_error("/login", "GitHub OAuth is not configured.")
     try:
         client = oauth.github
     except AttributeError:
-        return HTMLResponse("GitHub OAuth not configured", status_code=500)
+        return redirect_with_error("/login", "GitHub OAuth client is not available.")
     redirect_uri = request.url_for("auth_callback")
-    return await client.authorize_redirect(request, redirect_uri)
+    try:
+        return await client.authorize_redirect(request, redirect_uri)
+    except Exception:
+        return redirect_with_error(
+            "/login",
+            "GitHub OAuth redirect failed. Verify client ID, secret, and callback URL.",
+        )
 
 
 @app.get("/auth/github/callback")
@@ -2297,7 +2316,10 @@ async def auth_callback(request: Request):
         token = await oauth.github.authorize_access_token(request)
     except MismatchingStateError:
         request.session.clear()
-        return RedirectResponse("/login")
+        return redirect_with_error("/login", "Login session expired. Please try again.")
+    except Exception:
+        request.session.clear()
+        return redirect_with_error("/login", "GitHub callback failed. Please retry sign in.")
     resp = await oauth.github.get("user", token=token)
     profile = resp.json()
 

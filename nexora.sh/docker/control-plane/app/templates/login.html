@@ -3,6 +3,13 @@
 <div class="card" style="max-width:520px; margin: 80px auto; text-align:center;">
   <h2 style="margin:0 0 8px;">Welcome to Nexora</h2>
   <p class="muted" style="margin:0 0 20px;">Sign in with GitHub to manage your projects and environments.</p>
-  <a class="btn primary" href="/auth/github">Continue with GitHub</a>
+  {% if oauth_ready %}
+    <a class="btn primary" href="/auth/github">Continue with GitHub</a>
+  {% else %}
+    <button class="btn primary disabled" type="button" disabled>GitHub Login Unavailable</button>
+    <p class="muted" style="margin:12px 0 0; font-size:12px;">
+      OAuth credentials are missing or invalid. Contact the platform admin.
+    </p>
+  {% endif %}
 </div>
 {% endblock %}
