@@ -3210,6 +3210,13 @@ def promote_project_env(
                     f"/projects/{project_id}/settings",
                     f"Source environment '{source_env}' is missing. Create it first.",
                 )
+            source_state = (envs[source_env].status or "").strip().lower()
+            if source_state in {"provisioning", "failed"}:
+                return redirect_with_error(
+                    f"/projects/{project_id}/settings",
+                    f"Source environment '{source_env}' is {source_state}. Wait until it is active before promotion.",
+                    {"env": source_env, "tab": "history"},
+                )
 
             if target_env not in envs:
                 source_settings = effective_env_settings(project, envs[source_env])

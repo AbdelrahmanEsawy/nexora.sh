@@ -187,6 +187,20 @@
             <input type="hidden" name="env" value="dev" />
             <button class="btn ghost danger" type="submit">Reset dev (empty)</button>
           </form>
+          <form method="post" action="/projects/{{ project.id }}/promote">
+            <input type="hidden" name="source_env" value="dev" />
+            <input type="hidden" name="target_env" value="staging" />
+            <button class="btn ghost" type="submit">
+              {{ "Promote dev → staging" if staging_env else "Create staging from dev" }}
+            </button>
+          </form>
+          <form method="post" action="/projects/{{ project.id }}/promote">
+            <input type="hidden" name="source_env" value="dev" />
+            <input type="hidden" name="target_env" value="prod" />
+            <button class="btn ghost" type="submit">
+              {{ "Promote dev → prod" if prod_env else "Create prod from dev" }}
+            </button>
+          </form>
         {% endif %}
 
         {% if selected_env == 'staging' %}
