@@ -304,27 +304,26 @@
       </div>
     {% else %}
       {% if selected_env_obj %}
-        <form method="post" action="/projects/{{ project.id }}/envs/{{ selected_env_obj.id }}/settings" class="card" style="background:#0b1220; border-color:rgba(255,255,255,0.06); box-shadow:none; margin-bottom:10px;">
+        <div class="card" style="background:#0b1220; border-color:rgba(255,255,255,0.06); box-shadow:none; margin-bottom:10px;">
           <div class="project-title" style="font-size:16px; margin-bottom:10px;">Branch configuration</div>
+          <div class="muted" style="font-size:12px; margin-bottom:10px;">
+            Runtime profile is managed at project level and applies to all branches/environments.
+          </div>
           <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));">
             <div>
               <div class="muted" style="font-size:12px; margin-bottom:6px;">Database workers</div>
-              <input class="input" type="number" min="1" name="workers" value="{{ selected_env_obj.workers or project.workers or 1 }}" />
+              <input class="input" type="number" value="{{ project.workers or 1 }}" disabled />
             </div>
             <div>
               <div class="muted" style="font-size:12px; margin-bottom:6px;">Filestore size (Gi)</div>
-              <input class="input" type="number" min="1" name="storage_gb" value="{{ selected_env_obj.storage_gb or project.storage_gb or 1 }}" />
+              <input class="input" type="number" value="{{ project.storage_gb or 1 }}" disabled />
             </div>
             <div>
               <div class="muted" style="font-size:12px; margin-bottom:6px;">Odoo version (community)</div>
-              <input class="input" name="odoo_version" value="{{ selected_env_obj.odoo_version or project.odoo_version or '19.0' }}" />
+              <input class="input" value="{{ project.odoo_version or '19.0' }}" disabled />
             </div>
           </div>
-          <div class="spacer"></div>
-          <div class="row" style="justify-content:flex-end;">
-            <button class="btn primary" type="submit">Save branch settings</button>
-          </div>
-        </form>
+        </div>
 
         <div class="card" style="background:#0b1220; border-color:rgba(255,255,255,0.06); box-shadow:none;">
           <div class="project-title" style="font-size:16px; margin-bottom:10px;">Custom domains</div>

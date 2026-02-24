@@ -1167,16 +1167,10 @@ def odoo_image_for_version(version: str) -> str:
 
 
 def effective_env_settings(project: Project, env_obj: Optional["Environment"] = None) -> dict:
+    # Runtime profile is project-scoped by design (not per-branch).
     workers = project.workers or DEFAULT_WORKERS
     storage_gb = project.storage_gb or DEFAULT_STORAGE_GB
     odoo_version = project.odoo_version or DEFAULT_ODOO_VERSION
-    if env_obj:
-        if env_obj.workers:
-            workers = env_obj.workers
-        if env_obj.storage_gb:
-            storage_gb = env_obj.storage_gb
-        if env_obj.odoo_version:
-            odoo_version = env_obj.odoo_version
     return {
         "workers": max(1, int(workers)),
         "storage_gb": max(1, int(storage_gb)),
@@ -3006,15 +3000,30 @@ def update_project_settings(
             if locked:
                 return locked
 
+            new_workers = max(1, int(workers))
+            new_storage = max(1, int(storage_gb))
+            new_odoo_version = (odoo_version.strip() or DEFAULT_ODOO_VERSION)
+
+            # PVC size cannot be decreased; enforce at project level.
+            max_current_storage = max(
+                [project.storage_gb or DEFAULT_STORAGE_GB]
+                + [(env.storage_gb or project.storage_gb or DEFAULT_STORAGE_GB) for env in list(project.envs)]
+            )
+            if new_storage < max_current_storage:
+                return redirect_with_error(
+                    f"/projects/{project_id}/settings",
+                    f"Filestore size cannot be decreased below {max_current_storage}Gi.",
+                )
+
             project.display_name = display_name.strip()[:80] or project.slug
             project.dev_branch = dev_branch.strip() or DEFAULT_DEV_BRANCH
             project.staging_branch = staging_branch.strip() or DEFAULT_STAGING_BRANCH
             project.prod_branch = prod_branch.strip() or DEFAULT_PROD_BRANCH
-            project.workers = max(1, int(workers))
-            project.storage_gb = max(1, int(storage_gb))
+            project.workers = new_workers
+            project.storage_gb = new_storage
             project.staging_slots = max(1, int(staging_slots))
             project.subscription_code = subscription_code.strip()[:120]
-            project.odoo_version = (odoo_version.strip() or DEFAULT_ODOO_VERSION)
+            project.odoo_version = new_odoo_version
             normalized_hosting = normalize_hosting_location(hosting_location)
             if normalized_hosting and normalized_hosting not in hosting_location_map:
                 normalized_hosting = ""
@@ -3025,6 +3034,9 @@ def update_project_settings(
 
             # Reconcile existing environments with new settings.
             for env in list(project.envs):
+                env.workers = project.workers
+                env.storage_gb = project.storage_gb
+                env.odoo_version = project.odoo_version
                 host, db_name = provision_env(project, env.name, env)
                 env.host = host
                 env.db_name = db_name
@@ -3046,9 +3058,6 @@ def update_env_settings(
     request: Request,
     project_id: int,
     env_id: int,
-    workers: int = Form(...),
-    storage_gb: int = Form(...),
-    odoo_version: str = Form(DEFAULT_ODOO_VERSION),
 ):
     user = current_user(request)
     if not user:
@@ -3065,34 +3074,16 @@ def update_env_settings(
             env = db.query(Environment).filter(Environment.id == env_id).first()
             if not env or env.project_id != project.id:
                 return redirect_with_error(f"/projects/{project_id}/settings", "Invalid environment.")
-
-            new_workers = max(1, int(workers))
-            new_storage = max(1, int(storage_gb))
-            current_storage = env.storage_gb or project.storage_gb or DEFAULT_STORAGE_GB
-            if new_storage < current_storage:
-                return redirect_with_error(
-                    f"/projects/{project_id}/settings",
-                    "Filestore size cannot be decreased.",
-                )
-
-            env.workers = new_workers
-            env.storage_gb = new_storage
-            env.odoo_version = (odoo_version.strip() or DEFAULT_ODOO_VERSION)
-            db.commit()
-            db.refresh(env)
-
-            host, db_name = provision_env(project, env.name, env)
-            env.host = host
-            env.db_name = db_name
-            env.status = "active"
-            env.last_error = ""
-            db.commit()
+            return redirect_with_notice(
+                f"/projects/{project_id}/settings",
+                "Database workers, filestore size, and Odoo version are managed from Project Settings only.",
+                {"env": env.name, "tab": "settings"},
+            )
     except Exception as exc:
         return redirect_with_error(
             f"/projects/{project_id}/settings",
             f"Saving environment settings failed: {str(exc)[:200]}",
         )
-
     return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
 
 
