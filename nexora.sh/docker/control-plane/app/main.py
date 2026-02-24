@@ -9,7 +9,7 @@ import threading
 import time
 from datetime import datetime
 from typing import Optional
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import httpx
 import psycopg2
@@ -29,6 +29,8 @@ ODOO_NAMESPACE = os.getenv("ODOO_NAMESPACE", "odoo-system")
 ODOO_IMAGE = os.getenv("ODOO_IMAGE", "odoo:19")
 ODOO_ADMIN_PASSWD = os.getenv("ODOO_ADMIN_PASSWD")
 ADMIN_GITHUB = os.getenv("ADMIN_GITHUB", "").lower()
+MASTER_ADMIN_EMAIL = os.getenv("MASTER_ADMIN_EMAIL", "").strip().lower()
+MASTER_ADMIN_EMAILS_RAW = os.getenv("MASTER_ADMIN_EMAILS", "admin@nexora.red").strip().lower()
 
 DB_HOST = os.getenv("DB_HOST")
 DB_PORT = os.getenv("DB_PORT", "5432")
@@ -57,52 +59,101 @@ KUBECTL_GET_TIMEOUT = int(os.getenv("KUBECTL_GET_TIMEOUT", "8"))
 KUBECTL_MUTATE_TIMEOUT = int(os.getenv("KUBECTL_MUTATE_TIMEOUT", "30"))
 DB_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "8"))
 DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "20000"))
+OVH_ENDPOINT = os.getenv("OVH_ENDPOINT", "ovh-ca").strip().lower()
+OVH_PROJECT_ID = (os.getenv("OVH_PROJECT_ID") or os.getenv("OVH_SERVICE_NAME") or "").strip()
+OVH_APPLICATION_KEY = os.getenv("OVH_APPLICATION_KEY", "").strip()
+OVH_APPLICATION_SECRET = os.getenv("OVH_APPLICATION_SECRET", "").strip()
+OVH_CONSUMER_KEY = os.getenv("OVH_CONSUMER_KEY", "").strip()
+OVH_API_TIMEOUT = int(os.getenv("OVH_API_TIMEOUT", "12"))
+OVH_QUOTA_CACHE_TTL = max(5, int(os.getenv("OVH_QUOTA_CACHE_TTL", "30")))
 
-HOSTING_LOCATIONS = [
-    {
-        "code": "ca-tor",
-        "label": "Canada",
-        "region": "Americas",
-        "probe_url": "https://speedtest-tor1.digitalocean.com/1mb.test",
-    },
-    {
-        "code": "us-east",
-        "label": "Americas",
-        "region": "Americas",
-        "probe_url": "https://speedtest-nyc1.digitalocean.com/1mb.test",
-    },
-    {
-        "code": "eu-central",
-        "label": "Europe",
-        "region": "Europe",
-        "probe_url": "https://speedtest-fra1.digitalocean.com/1mb.test",
-    },
-    {
-        "code": "me",
-        "label": "Middle East",
-        "region": "Middle East",
-        "probe_url": "https://speedtest-fra1.digitalocean.com/1mb.test",
-    },
-    {
-        "code": "in-south",
-        "label": "Southern Asia",
-        "region": "Asia",
-        "probe_url": "https://speedtest-blr1.digitalocean.com/1mb.test",
-    },
-    {
-        "code": "sea",
-        "label": "Southeast Asia",
-        "region": "Asia",
-        "probe_url": "https://speedtest-sgp1.digitalocean.com/1mb.test",
-    },
-    {
-        "code": "au-syd",
-        "label": "Oceania",
-        "region": "Oceania",
-        "probe_url": "https://speedtest-syd1.digitalocean.com/1mb.test",
-    },
+DEFAULT_HOSTING_LOCATIONS = [
+    {"code": "uk1", "label": "London (UK1)", "region": "Europe", "ovh_region": "UK1"},
+    {"code": "mil", "label": "Milan (EU-SOUTH-MIL)", "region": "Europe", "ovh_region": "MIL"},
+    {"code": "rbx", "label": "Roubaix (RBX-A)", "region": "Europe", "ovh_region": "RBX"},
+    {"code": "par", "label": "Paris (EU-WEST-PAR)", "region": "Europe", "ovh_region": "PAR"},
+    {"code": "de1", "label": "Frankfurt (DE1)", "region": "Europe", "ovh_region": "DE1"},
+    {"code": "waw1", "label": "Warsaw (WAW1)", "region": "Europe", "ovh_region": "WAW1"},
+    {"code": "sbg5", "label": "Strasbourg (SBG5)", "region": "Europe", "ovh_region": "SBG5"},
+    {"code": "bhs5", "label": "Beauharnois (BHS5)", "region": "Americas", "ovh_region": "BHS5"},
+    {"code": "gra9", "label": "Gravelines (GRA9)", "region": "Europe", "ovh_region": "GRA9"},
 ]
-HOSTING_LOCATION_MAP = {item["code"]: item for item in HOSTING_LOCATIONS}
+
+DEFAULT_HOSTING_LOCATION_MAP = {item["code"]: item for item in DEFAULT_HOSTING_LOCATIONS}
+
+OVH_ENDPOINT_BASE_URLS = {
+    "ovh-eu": "https://eu.api.ovh.com/1.0",
+    "ovh-ca": "https://ca.api.ovh.com/1.0",
+    "ovh-us": "https://api.us.ovhcloud.com/1.0",
+}
+
+OVH_REGION_ALIASES = {
+    "RBX-A": "RBX",
+    "EU-WEST-PAR": "PAR",
+    "EU-SOUTH-MIL": "MIL",
+    "BHS": "BHS5",
+    "GRA": "GRA9",
+}
+
+OVH_REGION_LABELS = {
+    "UK1": "London (UK1)",
+    "MIL": "Milan (EU-SOUTH-MIL)",
+    "RBX": "Roubaix (RBX-A)",
+    "PAR": "Paris (EU-WEST-PAR)",
+    "DE1": "Frankfurt (DE1)",
+    "WAW1": "Warsaw (WAW1)",
+    "SBG5": "Strasbourg (SBG5)",
+    "BHS5": "Beauharnois (BHS5)",
+    "GRA9": "Gravelines (GRA9)",
+}
+
+OVH_REGION_GROUPS = {
+    "UK1": "Europe",
+    "MIL": "Europe",
+    "RBX": "Europe",
+    "PAR": "Europe",
+    "DE1": "Europe",
+    "WAW1": "Europe",
+    "SBG5": "Europe",
+    "GRA9": "Europe",
+    "BHS5": "Americas",
+}
+
+OVH_REGION_ORDER = [
+    "UK1",
+    "MIL",
+    "RBX",
+    "PAR",
+    "DE1",
+    "WAW1",
+    "SBG5",
+    "BHS5",
+    "GRA9",
+]
+
+OVH_REGION_PROBE_URLS = {
+    "BHS5": "https://s3.bhs.io.cloud.ovh.net",
+    "DE1": "https://s3.de.io.cloud.ovh.net",
+    "GRA9": "https://s3.gra.io.cloud.ovh.net",
+    "PAR": "https://s3.gra.io.cloud.ovh.net",
+    "MIL": "https://s3.gra.io.cloud.ovh.net",
+    "RBX": "https://s3.rbx.io.cloud.ovh.net",
+    "SBG5": "https://s3.sbg.io.cloud.ovh.net",
+    "UK1": "https://s3.de.io.cloud.ovh.net",
+    "WAW1": "https://s3.waw.io.cloud.ovh.net",
+}
+
+OVH_QUOTA_CACHE = {
+    "fetched_at": 0.0,
+    "data": None,
+    "error": "",
+}
+
+MASTER_ADMIN_EMAILS = {
+    email.strip().lower()
+    for email in [*MASTER_ADMIN_EMAILS_RAW.split(","), MASTER_ADMIN_EMAIL]
+    if email and "@" in email
+}
 
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 DB_PATH = os.path.join(DATA_DIR, "nexora.db")
@@ -117,6 +168,7 @@ class User(Base):
     id = Column(Integer, primary_key=True)
     github_id = Column(String, unique=True, nullable=False)
     username = Column(String, unique=True, nullable=False)
+    email = Column(String, nullable=True)
     name = Column(String, nullable=True)
     is_admin = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -212,6 +264,14 @@ Base.metadata.create_all(engine)
 
 def ensure_schema():
     with engine.begin() as conn:
+        user_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(users)"))}
+        for name, ddl in [
+            ("email", "email TEXT"),
+            ("is_admin", "is_admin BOOLEAN"),
+        ]:
+            if name not in user_cols:
+                conn.execute(text(f"ALTER TABLE users ADD COLUMN {ddl}"))
+
         cols = {row[1] for row in conn.execute(text("PRAGMA table_info(projects)"))}
         for name, ddl in [
             ("display_name", "display_name TEXT"),
@@ -356,9 +416,15 @@ def redirect_with_notice(path: str, message: str, extra: Optional[dict] = None):
 
 def normalize_hosting_location(code: str) -> str:
     code = (code or "").strip().lower()
-    if code in HOSTING_LOCATION_MAP:
-        return code
-    return ""
+    if not code:
+        return ""
+    code = re.sub(r"[^a-z0-9-]", "-", code)
+    code = re.sub(r"-+", "-", code).strip("-")
+    if not code:
+        return ""
+    if len(code) > 48:
+        return ""
+    return code
 
 
 def parse_ping_ms(value: str) -> Optional[int]:
@@ -372,11 +438,347 @@ def parse_ping_ms(value: str) -> Optional[int]:
     return max(1, min(20000, ping))
 
 
-def hosting_location_label(code: str) -> str:
-    item = HOSTING_LOCATION_MAP.get((code or "").strip().lower())
-    if not item:
+def canonical_ovh_region(region: str) -> str:
+    raw = (region or "").strip().upper()
+    if not raw:
+        return ""
+    if raw in OVH_REGION_ALIASES:
+        return OVH_REGION_ALIASES[raw]
+    return raw
+
+
+def hosting_location_for_region(region: str) -> dict:
+    canonical = canonical_ovh_region(region)
+    if not canonical:
+        return {}
+    code = normalize_hosting_location(canonical)
+    label = OVH_REGION_LABELS.get(canonical, canonical)
+    region_group = OVH_REGION_GROUPS.get(canonical, "OVH")
+    probe_url = OVH_REGION_PROBE_URLS.get(canonical)
+    if not probe_url:
+        if region_group == "Americas":
+            probe_url = OVH_REGION_PROBE_URLS.get("BHS5", "")
+        else:
+            probe_url = OVH_REGION_PROBE_URLS.get("GRA9", "")
+    return {
+        "code": code,
+        "label": label,
+        "region": region_group,
+        "ovh_region": canonical,
+        "probe_url": probe_url,
+    }
+
+
+def default_hosting_locations() -> list[dict]:
+    locations = []
+    for item in DEFAULT_HOSTING_LOCATIONS:
+        ovh_region = item.get("ovh_region") or item.get("code") or ""
+        location = hosting_location_for_region(ovh_region)
+        if location:
+            locations.append(location)
+    return locations
+
+
+def hosting_location_map_from_list(hosting_locations: list[dict]) -> dict:
+    return {
+        item["code"]: item
+        for item in hosting_locations
+        if isinstance(item, dict) and item.get("code")
+    }
+
+
+def hosting_location_label(code: str, hosting_location_map: Optional[dict] = None) -> str:
+    normalized = normalize_hosting_location(code)
+    if not normalized:
         return "Auto"
-    return item["label"]
+    location_map = hosting_location_map or DEFAULT_HOSTING_LOCATION_MAP
+    item = location_map.get(normalized) if isinstance(location_map, dict) else None
+    if item and item.get("label"):
+        return str(item["label"])
+    return normalized.upper()
+
+
+def parse_hosting_probe_results(raw: str) -> dict[str, int]:
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    result: dict[str, int] = {}
+    for code, value in parsed.items():
+        normalized = normalize_hosting_location(str(code))
+        if not normalized:
+            continue
+        ping = parse_ping_ms(str(value))
+        if ping is None:
+            continue
+        result[normalized] = ping
+    return result
+
+
+def hosting_location_order(code: str, hosting_locations: Optional[list[dict]] = None) -> int:
+    normalized = normalize_hosting_location(code)
+    source = hosting_locations or default_hosting_locations()
+    for idx, item in enumerate(source):
+        if item["code"] == normalized:
+            return idx
+    return 10_000
+
+
+def best_location_by_ping(
+    codes: list[str],
+    probe_results: dict[str, int],
+    hosting_locations: Optional[list[dict]] = None,
+) -> str:
+    if not codes:
+        return ""
+
+    def sort_key(code: str):
+        ping = probe_results.get(code)
+        has_ping = isinstance(ping, int)
+        return (
+            0 if has_ping else 1,
+            ping if has_ping else 10_000_000,
+            hosting_location_order(code, hosting_locations),
+        )
+
+    return sorted(codes, key=sort_key)[0]
+
+
+def ovh_quota_checks_enabled() -> bool:
+    return bool(
+        OVH_PROJECT_ID
+        and OVH_APPLICATION_KEY
+        and OVH_APPLICATION_SECRET
+        and OVH_CONSUMER_KEY
+    )
+
+
+def ovh_api_base_url() -> str:
+    return OVH_ENDPOINT_BASE_URLS.get(OVH_ENDPOINT, OVH_ENDPOINT_BASE_URLS["ovh-ca"])
+
+
+def ovh_auth_time(base_url: str) -> int:
+    resp = httpx.get(f"{base_url}/auth/time", timeout=max(3, min(OVH_API_TIMEOUT, 10)))
+    resp.raise_for_status()
+    return int((resp.text or "").strip())
+
+
+def ovh_api_request(method: str, path: str, payload: Optional[dict] = None):
+    if not ovh_quota_checks_enabled():
+        raise RuntimeError("OVH quota checks are not configured")
+
+    base_url = ovh_api_base_url()
+    method = method.upper()
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False) if payload is not None else ""
+    url = f"{base_url}{path}"
+    timestamp = ovh_auth_time(base_url)
+    signature_base = f"{OVH_APPLICATION_SECRET}+{OVH_CONSUMER_KEY}+{method}+{url}+{body}+{timestamp}"
+    signature = "$1$" + hashlib.sha1(signature_base.encode("utf-8")).hexdigest()
+
+    headers = {
+        "X-Ovh-Application": OVH_APPLICATION_KEY,
+        "X-Ovh-Consumer": OVH_CONSUMER_KEY,
+        "X-Ovh-Timestamp": str(timestamp),
+        "X-Ovh-Signature": signature,
+    }
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+
+    resp = httpx.request(
+        method,
+        url,
+        headers=headers,
+        content=body.encode("utf-8") if body else None,
+        timeout=OVH_API_TIMEOUT,
+    )
+    if resp.status_code >= 400:
+        msg = (resp.text or "").strip().replace("\n", " ")
+        raise RuntimeError(f"OVH API {resp.status_code}: {msg[:200] or 'request failed'}")
+    if not (resp.text or "").strip():
+        return None
+    try:
+        return resp.json()
+    except Exception:
+        return None
+
+
+def ovh_project_quotas(force: bool = False) -> tuple[Optional[list], str]:
+    if not ovh_quota_checks_enabled():
+        return None, "disabled"
+
+    now = time.time()
+    cached_at = float(OVH_QUOTA_CACHE.get("fetched_at") or 0.0)
+    cached_data = OVH_QUOTA_CACHE.get("data")
+    cached_error = str(OVH_QUOTA_CACHE.get("error") or "")
+    if not force and (now - cached_at) < OVH_QUOTA_CACHE_TTL:
+        if isinstance(cached_data, list):
+            return cached_data, ""
+        if cached_error:
+            return None, cached_error
+
+    try:
+        encoded_project = quote(OVH_PROJECT_ID, safe="")
+        data = ovh_api_request("GET", f"/cloud/project/{encoded_project}/quota")
+        if not isinstance(data, list):
+            raise RuntimeError("Unexpected OVH quota response")
+        OVH_QUOTA_CACHE["fetched_at"] = now
+        OVH_QUOTA_CACHE["data"] = data
+        OVH_QUOTA_CACHE["error"] = ""
+        return data, ""
+    except Exception as exc:
+        message = str(exc)[:220]
+        OVH_QUOTA_CACHE["fetched_at"] = now
+        OVH_QUOTA_CACHE["data"] = None
+        OVH_QUOTA_CACHE["error"] = message
+        return None, message
+
+
+def quota_remaining(quota_block: dict, max_key: str, used_key: str) -> Optional[int]:
+    if not isinstance(quota_block, dict):
+        return None
+    try:
+        maximum = int(quota_block.get(max_key) or 0)
+        used = int(quota_block.get(used_key) or 0)
+    except Exception:
+        return None
+    return maximum - used
+
+
+def summarize_region_quota(quota: dict) -> dict:
+    instance = quota.get("instance") or {}
+    volume = quota.get("volume") or {}
+    remaining_instances = quota_remaining(instance, "maxInstances", "usedInstances")
+    remaining_cores = quota_remaining(instance, "maxCores", "usedCores")
+    remaining_ram = quota_remaining(instance, "maxRam", "usedRAM")
+    remaining_volume_count = quota_remaining(volume, "maxVolumeCount", "volumeCount")
+    remaining_volume_gb = quota_remaining(volume, "maxGigabytes", "usedGigabytes")
+
+    required = [remaining_instances, remaining_cores, remaining_ram]
+    available = all((value is not None and value > 0) for value in required)
+    if remaining_volume_count is not None:
+        available = available and remaining_volume_count > 0
+    if remaining_volume_gb is not None:
+        available = available and remaining_volume_gb > 0
+
+    return {
+        "region": str(quota.get("region") or ""),
+        "available": bool(available),
+        "remaining_instances": remaining_instances,
+        "remaining_cores": remaining_cores,
+        "remaining_ram": remaining_ram,
+        "remaining_volume_count": remaining_volume_count,
+        "remaining_volume_gb": remaining_volume_gb,
+    }
+
+
+def hosting_capacity_snapshot(force: bool = False) -> dict:
+    fallback_hosting_locations = default_hosting_locations()
+    fallback_location_map = hosting_location_map_from_list(fallback_hosting_locations)
+    default_locations = {
+        item["code"]: {
+            "available": True,
+            "region": item.get("ovh_region", ""),
+            "reason": "",
+            "checked": False,
+        }
+        for item in fallback_hosting_locations
+    }
+
+    if not ovh_quota_checks_enabled():
+        for code in default_locations:
+            default_locations[code]["reason"] = "OVH quota check disabled"
+        return {
+            "mode": "disabled",
+            "message": "OVH quota check disabled",
+            "locations": default_locations,
+            "hosting_locations": fallback_hosting_locations,
+            "hosting_location_map": fallback_location_map,
+        }
+
+    quotas, error = ovh_project_quotas(force=force)
+    if not isinstance(quotas, list):
+        for code in default_locations:
+            default_locations[code]["reason"] = "OVH quota lookup failed"
+        return {
+            "mode": "error",
+            "message": error or "OVH quota lookup failed",
+            "locations": default_locations,
+            "hosting_locations": fallback_hosting_locations,
+            "hosting_location_map": fallback_location_map,
+        }
+
+    region_summaries = [
+        summarize_region_quota(item or {})
+        for item in quotas
+        if isinstance(item, dict) and (item.get("region") or "")
+    ]
+    if not region_summaries:
+        for code in default_locations:
+            default_locations[code]["reason"] = "No OVH regions returned"
+        return {
+            "mode": "error",
+            "message": "No OVH regions returned for this project",
+            "locations": default_locations,
+            "hosting_locations": fallback_hosting_locations,
+            "hosting_location_map": fallback_location_map,
+        }
+
+    hosting_locations: list[dict] = []
+    locations: dict[str, dict] = {}
+    seen_codes = set()
+    for summary in region_summaries:
+        location_item = hosting_location_for_region(summary["region"])
+        code = location_item.get("code", "")
+        if not code:
+            continue
+        if code not in seen_codes:
+            hosting_locations.append(location_item)
+            seen_codes.add(code)
+        reason = "Free quota available" if summary["available"] else "No free quota"
+        locations[code] = {
+            "available": bool(summary["available"]),
+            "region": summary["region"],
+            "reason": reason,
+            "checked": True,
+            "remaining_instances": summary["remaining_instances"],
+            "remaining_cores": summary["remaining_cores"],
+            "remaining_ram": summary["remaining_ram"],
+            "remaining_volume_count": summary["remaining_volume_count"],
+            "remaining_volume_gb": summary["remaining_volume_gb"],
+        }
+
+    order_index = {region: idx for idx, region in enumerate(OVH_REGION_ORDER)}
+    hosting_locations.sort(
+        key=lambda item: (
+            order_index.get(canonical_ovh_region(item.get("ovh_region", "")), 999),
+            item.get("label", ""),
+        )
+    )
+    hosting_location_map = hosting_location_map_from_list(hosting_locations)
+
+    return {
+        "mode": "active",
+        "message": "",
+        "locations": locations,
+        "hosting_locations": hosting_locations,
+        "hosting_location_map": hosting_location_map,
+    }
+
+
+def hosting_catalog(force: bool = False) -> tuple[list[dict], dict, dict]:
+    snapshot = hosting_capacity_snapshot(force=force)
+    hosting_locations = snapshot.get("hosting_locations")
+    if not isinstance(hosting_locations, list) or not hosting_locations:
+        hosting_locations = default_hosting_locations()
+    hosting_location_map = snapshot.get("hosting_location_map")
+    if not isinstance(hosting_location_map, dict) or not hosting_location_map:
+        hosting_location_map = hosting_location_map_from_list(hosting_locations)
+    return hosting_locations, hosting_location_map, snapshot
 
 
 def env_logs_tail(slug: str, env_name: str, lines: int = 200) -> str:
@@ -435,6 +837,61 @@ def verify_github_signature(secret: str, body: bytes, signature: str) -> bool:
     digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
     expected = f"sha256={digest}"
     return hmac.compare_digest(expected, signature)
+
+
+def is_master_admin_user(username: str, email: str) -> bool:
+    login = (username or "").strip().lower()
+    mail = (email or "").strip().lower()
+    if login and login == ADMIN_GITHUB:
+        return True
+    if mail and mail in MASTER_ADMIN_EMAILS:
+        return True
+    return False
+
+
+async def github_primary_email(token: dict, profile: dict) -> str:
+    direct = (profile.get("email") or "").strip().lower()
+    if direct:
+        return direct
+    try:
+        resp = await oauth.github.get("user/emails", token=token)
+        payload = resp.json()
+    except Exception:
+        return ""
+    if not isinstance(payload, list):
+        return ""
+    verified_primary = next(
+        (
+            item
+            for item in payload
+            if isinstance(item, dict)
+            and item.get("verified")
+            and item.get("primary")
+            and item.get("email")
+        ),
+        None,
+    )
+    if verified_primary:
+        return str(verified_primary.get("email") or "").strip().lower()
+    verified_any = next(
+        (
+            item
+            for item in payload
+            if isinstance(item, dict)
+            and item.get("verified")
+            and item.get("email")
+        ),
+        None,
+    )
+    if verified_any:
+        return str(verified_any.get("email") or "").strip().lower()
+    first = next(
+        (item for item in payload if isinstance(item, dict) and item.get("email")),
+        None,
+    )
+    if not first:
+        return ""
+    return str(first.get("email") or "").strip().lower()
 
 
 def sync_installation_repos(installation_id: str):
@@ -1488,6 +1945,7 @@ def index(request: Request):
     prefill_display = request.query_params.get("display_name", "")
     prefill_hosting_location = normalize_hosting_location(request.query_params.get("hosting_location", ""))
     prefill_hosting_ping = parse_ping_ms(request.query_params.get("hosting_ping_ms", ""))
+    hosting_locations, hosting_location_map, _ = hosting_catalog()
 
     with db_session() as db:
         if user.is_admin:
@@ -1511,8 +1969,8 @@ def index(request: Request):
                 "prefill_display": prefill_display,
                 "prefill_hosting_location": prefill_hosting_location,
                 "prefill_hosting_ping": prefill_hosting_ping,
-                "hosting_locations": HOSTING_LOCATIONS,
-                "hosting_location_map": HOSTING_LOCATION_MAP,
+                "hosting_locations": hosting_locations,
+                "hosting_location_map": hosting_location_map,
             },
         )
 
@@ -1520,6 +1978,15 @@ def index(request: Request):
 @app.get("/projects", response_class=HTMLResponse)
 def projects_index(request: Request):
     return index(request)
+
+
+@app.get("/api/hosting/availability")
+def hosting_availability(request: Request):
+    user = current_user(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    force = (request.query_params.get("force") or "").strip().lower() in {"1", "true", "yes"}
+    return JSONResponse(hosting_capacity_snapshot(force=force))
 
 
 @app.get("/login", response_class=HTMLResponse)
@@ -1563,8 +2030,10 @@ async def auth_callback(request: Request):
     username = profile.get("login")
     github_id = str(profile.get("id"))
     name = profile.get("name")
+    email = await github_primary_email(token, profile)
     if not username or not github_id:
         return HTMLResponse("GitHub login failed", status_code=400)
+    admin_match = is_master_admin_user(username, email)
 
     with db_session() as db:
         user = db.query(User).filter(User.github_id == github_id).first()
@@ -1572,10 +2041,20 @@ async def auth_callback(request: Request):
             user = User(
                 github_id=github_id,
                 username=username,
+                email=email or None,
                 name=name,
-                is_admin=username.lower() == ADMIN_GITHUB,
+                is_admin=admin_match,
             )
             db.add(user)
+            db.commit()
+            db.refresh(user)
+        else:
+            user.username = username
+            user.name = name
+            if email:
+                user.email = email
+            if admin_match:
+                user.is_admin = True
             db.commit()
             db.refresh(user)
         request.session["user_id"] = user.id
@@ -1664,6 +2143,7 @@ def create_project(
     display_name: str = Form(None),
     hosting_location: str = Form(""),
     hosting_ping_ms: str = Form(""),
+    hosting_probe_results: str = Form(""),
 ):
     user = current_user(request)
     if not user:
@@ -1673,6 +2153,14 @@ def create_project(
     raw_display = (display_name or "").strip()
     selected_hosting_location = normalize_hosting_location(hosting_location)
     selected_hosting_ping = parse_ping_ms(hosting_ping_ms)
+    probe_results = parse_hosting_probe_results(hosting_probe_results)
+    if (
+        selected_hosting_location
+        and selected_hosting_ping is not None
+        and selected_hosting_location not in probe_results
+    ):
+        probe_results[selected_hosting_location] = selected_hosting_ping
+    fallback_notice = ""
 
     try:
         ensure_prereqs()
@@ -1701,6 +2189,53 @@ def create_project(
                 "hosting_ping_ms": selected_hosting_ping or "",
             },
         )
+
+    hosting_locations, hosting_location_map, availability = hosting_catalog()
+    availability_mode = str(availability.get("mode") or "")
+    availability_locations = availability.get("locations") or {}
+    if selected_hosting_location and selected_hosting_location not in hosting_location_map:
+        selected_hosting_location = ""
+        selected_hosting_ping = None
+
+    if availability_mode == "active":
+        available_codes = [
+            item["code"]
+            for item in hosting_locations
+            if bool((availability_locations.get(item["code"]) or {}).get("available"))
+        ]
+        if not available_codes:
+            return redirect_with_error(
+                "/",
+                "No OVH location currently has free quota. Increase OVH quota and retry.",
+                {
+                    "slug": slug,
+                    "display_name": raw_display,
+                    "hosting_location": selected_hosting_location,
+                    "hosting_ping_ms": selected_hosting_ping or "",
+                },
+            )
+
+        if not selected_hosting_location or selected_hosting_location not in available_codes:
+            chosen = best_location_by_ping(available_codes, probe_results, hosting_locations)
+            if chosen:
+                if selected_hosting_location and selected_hosting_location != chosen:
+                    from_label = hosting_location_label(selected_hosting_location, hosting_location_map)
+                    reason = (
+                        (availability_locations.get(selected_hosting_location) or {}).get("reason")
+                        or "No free quota"
+                    )
+                    to_label = hosting_location_label(chosen, hosting_location_map)
+                    fallback_notice = f"{from_label} has no OVH capacity ({reason}). Switched to {to_label}."
+                selected_hosting_location = chosen
+
+        if selected_hosting_location and selected_hosting_ping is None:
+            selected_hosting_ping = probe_results.get(selected_hosting_location)
+
+    elif not selected_hosting_location:
+        auto_code = best_location_by_ping(list(probe_results.keys()), probe_results, hosting_locations)
+        if auto_code:
+            selected_hosting_location = auto_code
+            selected_hosting_ping = probe_results.get(auto_code)
 
     with db_session() as db:
         if db.query(Project).filter(Project.slug == slug).first():
@@ -1753,6 +2288,11 @@ def create_project(
         created_project_id = project.id
 
     spawn_env_provision(created_project_id, "dev")
+    if fallback_notice:
+        return RedirectResponse(
+            f"/projects/{created_project_id}/settings?{urlencode({'notice': fallback_notice})}#env-dev",
+            status_code=303,
+        )
     return RedirectResponse(f"/projects/{created_project_id}/settings#env-dev", status_code=303)
 
 
@@ -1832,6 +2372,7 @@ def project_settings(request: Request, project_id: int):
     selected_tab = (request.query_params.get("tab") or "history").strip().lower()
     if selected_tab not in {"history", "logs", "settings"}:
         selected_tab = "history"
+    hosting_locations, hosting_location_map, _ = hosting_catalog()
     with db_session() as db:
         project = get_project_for_user(db, user, project_id)
         if not project:
@@ -1900,6 +2441,19 @@ def project_settings(request: Request, project_id: int):
             else:
                 branch_logs = f"{selected_env} environment has not been created yet."
 
+        current_loc = normalize_hosting_location(project.hosting_location or "")
+        if current_loc and current_loc not in hosting_location_map:
+            hosting_locations.append(
+                {
+                    "code": current_loc,
+                    "label": hosting_location_label(current_loc, hosting_location_map),
+                    "region": "Saved",
+                    "ovh_region": current_loc.upper(),
+                    "probe_url": "",
+                }
+            )
+            hosting_location_map = hosting_location_map_from_list(hosting_locations)
+
         return templates.TemplateResponse(
             "project_settings.html",
             {
@@ -1919,8 +2473,8 @@ def project_settings(request: Request, project_id: int):
                 "error": error,
                 "notice": notice,
                 "env_status": env_status,
-                "hosting_locations": HOSTING_LOCATIONS,
-                "hosting_location_map": HOSTING_LOCATION_MAP,
+                "hosting_locations": hosting_locations,
+                "hosting_location_map": hosting_location_map,
             },
         )
 
@@ -2023,6 +2577,7 @@ def update_project_settings(
     user = current_user(request)
     if not user:
         return RedirectResponse("/login")
+    hosting_locations, hosting_location_map, _ = hosting_catalog()
 
     try:
         with db_session() as db:
@@ -2042,7 +2597,10 @@ def update_project_settings(
             project.staging_slots = max(1, int(staging_slots))
             project.subscription_code = subscription_code.strip()[:120]
             project.odoo_version = (odoo_version.strip() or DEFAULT_ODOO_VERSION)
-            project.hosting_location = normalize_hosting_location(hosting_location) or None
+            normalized_hosting = normalize_hosting_location(hosting_location)
+            if normalized_hosting and normalized_hosting not in hosting_location_map:
+                normalized_hosting = ""
+            project.hosting_location = normalized_hosting or None
             project.hosting_ping_ms = parse_ping_ms(hosting_ping_ms)
             db.commit()
             db.refresh(project)
