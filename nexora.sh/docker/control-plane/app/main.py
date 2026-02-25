@@ -341,6 +341,14 @@ class BuildEvent(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class ProjectTombstone(Base):
+    __tablename__ = "project_tombstones"
+    id = Column(Integer, primary_key=True)
+    slug = Column(String, unique=True, nullable=False)
+    reason = Column(String, nullable=True)
+    deleted_at = Column(DateTime, default=datetime.utcnow)
+
+
 Base.metadata.create_all(engine)
 
 
@@ -493,6 +501,32 @@ if GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET:
 
 
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,30}$")
+
+
+def upsert_project_tombstone(db, slug: str, reason: str = ""):
+    clean = (slug or "").strip().lower()
+    if not clean:
+        return
+    row = db.query(ProjectTombstone).filter(ProjectTombstone.slug == clean).first()
+    if row:
+        row.reason = (reason or row.reason or "")[:200]
+        row.deleted_at = datetime.utcnow()
+        return
+    db.add(
+        ProjectTombstone(
+            slug=clean,
+            reason=(reason or "")[:200],
+        )
+    )
+
+
+def remove_project_tombstone(db, slug: str):
+    clean = (slug or "").strip().lower()
+    if not clean:
+        return
+    row = db.query(ProjectTombstone).filter(ProjectTombstone.slug == clean).first()
+    if row:
+        db.delete(row)
 
 
 def redirect_with_error(path: str, message: str, extra: Optional[dict] = None):
@@ -1431,8 +1465,15 @@ def reconcile_projects_from_cluster(owner_id: int) -> dict:
     imported_domains = 0
 
     with db_session() as db:
+        tombstoned_slugs = {
+            row.slug
+            for row in db.query(ProjectTombstone).all()
+            if row.slug
+        }
         existing = {p.slug: p for p in db.query(Project).all()}
         for slug, env_map in discovered.items():
+            if slug in tombstoned_slugs:
+                continue
             project = existing.get(slug)
             if not project:
                 project = Project(
@@ -2157,10 +2198,6 @@ def set_project_status(project_id: int, status: str, error: str = ""):
 
 
 def spawn_project_delete(project_id: int):
-    def _is_pvc_cleanup_timeout(err: str) -> bool:
-        text_value = (err or "").strip().lower()
-        return "kubectl timed out" in text_value and " delete pvc " in text_value
-
     def _worker():
         try:
             with db_session() as db:
@@ -2168,11 +2205,13 @@ def spawn_project_delete(project_id: int):
                 if not project:
                     return
                 slug = project.slug
-                env_names = [env.name for env in project.envs]
+                env_names = sorted({*["dev", "staging", "prod"], *[env.name for env in project.envs]})
                 env_domains = {
                     env.name: [domain.host for domain in env.domains]
                     for env in list(project.envs)
                 }
+                upsert_project_tombstone(db, slug, "delete")
+                db.commit()
 
             errors = []
             for env_name in env_names:
@@ -2185,19 +2224,12 @@ def spawn_project_delete(project_id: int):
                 project = db.query(Project).filter(Project.id == project_id).first()
                 if not project:
                     return
-                if errors:
-                    if all(_is_pvc_cleanup_timeout(err) for err in errors):
-                        # PVC detach can exceed request timeout. Remove from dashboard and keep best-effort cleanup.
-                        db.delete(project)
-                        db.commit()
-                        spawn_orphan_cleanup(slug, env_domains)
-                        return
-                    project.status = "delete_failed"
-                    project.last_error = "; ".join(errors)[:500]
-                    db.commit()
-                    return
+                upsert_project_tombstone(db, project.slug, "delete")
                 db.delete(project)
                 db.commit()
+            if errors:
+                # Keep deleting resources best-effort even after project is removed from dashboard.
+                spawn_orphan_cleanup(slug, env_domains)
         except Exception as exc:
             set_project_status(project_id, "delete_failed", str(exc))
 
@@ -2207,7 +2239,8 @@ def spawn_project_delete(project_id: int):
 
 def spawn_orphan_cleanup(slug: str, env_domains: dict[str, list[str]]):
     def _worker():
-        for env_name, hosts in env_domains.items():
+        for env_name in sorted({*["dev", "staging", "prod"], *env_domains.keys()}):
+            hosts = env_domains.get(env_name) or []
             try:
                 delete_env(slug, env_name, hosts)
             except Exception:
@@ -2295,6 +2328,11 @@ def index(request: Request):
         else:
             projects = db.query(Project).filter(Project.owner_id == user.id).all()
         projects.sort(key=lambda p: p.created_at, reverse=True)
+        stale_project_count = sum(
+            1
+            for project in projects
+            if (project.status or "").strip().lower() in {"deleting", "delete_failed"}
+        )
         env_order = {"prod": 0, "staging": 1, "dev": 2}
         for project in projects:
             project.envs.sort(key=lambda e: env_order.get(e.name, 99))
@@ -2313,6 +2351,7 @@ def index(request: Request):
                 "prefill_hosting_ping": prefill_hosting_ping,
                 "hosting_locations": hosting_locations,
                 "hosting_location_map": hosting_location_map,
+                "stale_project_count": stale_project_count,
             },
         )
 
@@ -2601,6 +2640,7 @@ def create_project(
             selected_hosting_ping = probe_results.get(auto_code)
 
     with db_session() as db:
+        remove_project_tombstone(db, slug)
         if db.query(Project).filter(Project.slug == slug).first():
             return redirect_with_error(
                 "/",
@@ -2683,6 +2723,7 @@ def delete_project(request: Request, project_id: int):
             return redirect_with_notice("/", f"Deletion is already running for {project.display_name or project.slug}.")
         project.status = "deleting"
         project.last_error = ""
+        upsert_project_tombstone(db, project.slug, "delete")
         db.commit()
         project_name = project.display_name or project.slug
 
@@ -2709,12 +2750,49 @@ def force_delete_project(request: Request, project_id: int):
             env.name: [domain.host for domain in env.domains]
             for env in list(project.envs)
         }
+        upsert_project_tombstone(db, slug, "force-delete")
 
         db.delete(project)
         db.commit()
 
     spawn_orphan_cleanup(slug, env_domains)
     return redirect_with_notice("/", f"{project_name} removed from dashboard. Cleanup continues in background.")
+
+
+@app.post("/projects/cleanup/stale")
+def cleanup_stale_projects(request: Request):
+    user = current_user(request)
+    if not user:
+        return RedirectResponse("/login")
+
+    payloads: list[tuple[str, dict[str, list[str]]]] = []
+    removed = 0
+    with db_session() as db:
+        query = db.query(Project).filter(Project.status.in_(["deleting", "delete_failed"]))
+        if not user.is_admin:
+            query = query.filter(Project.owner_id == user.id)
+        stale_projects = query.all()
+        for project in stale_projects:
+            slug = project.slug
+            env_domains = {
+                env.name: [domain.host for domain in env.domains]
+                for env in list(project.envs)
+            }
+            upsert_project_tombstone(db, slug, "stale-cleanup")
+            payloads.append((slug, env_domains))
+            db.delete(project)
+            removed += 1
+        db.commit()
+
+    for slug, env_domains in payloads:
+        spawn_orphan_cleanup(slug, env_domains)
+
+    if removed == 0:
+        return redirect_with_notice("/", "No stale deletions found.")
+    return redirect_with_notice(
+        "/",
+        f"Removed {removed} stale project(s) from dashboard. Cleanup continues in background.",
+    )
 
 
 def get_project_for_user(db, user: User, project_id: int) -> Optional[Project]:

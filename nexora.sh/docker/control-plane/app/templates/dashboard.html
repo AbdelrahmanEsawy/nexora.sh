@@ -63,6 +63,19 @@
   </form>
 </div>
 
+{% if stale_project_count and stale_project_count > 0 %}
+<div class="card" style="margin-bottom:16px;">
+  <div class="row" style="justify-content: space-between;">
+    <div class="muted" style="font-size:12px;">
+      {{ stale_project_count }} project(s) are stuck in deletion state. You can clear them from the dashboard while background cleanup continues.
+    </div>
+    <form method="post" action="/projects/cleanup/stale">
+      <button class="btn ghost danger" type="submit">Clear stale deletions</button>
+    </form>
+  </div>
+</div>
+{% endif %}
+
 {% if not projects %}
 <div class="card" style="margin-bottom:16px;">
   <div class="project-title">No Projects Yet</div>
