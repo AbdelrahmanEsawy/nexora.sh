@@ -1254,6 +1254,16 @@ def kubectl_get_list_json(namespace: str, kind: str, selector: str) -> Optional[
         return None
 
 
+def kubectl_names_by_selector(namespace: str, kind: str, selector: str) -> list[str]:
+    payload = kubectl_get_list_json(namespace, kind, selector) or {}
+    names: list[str] = []
+    for item in (payload.get("items") or []):
+        name = str((item.get("metadata") or {}).get("name") or "").strip()
+        if name:
+            names.append(name)
+    return sorted(set(names))
+
+
 def init_job_failure_reason(slug: str, env: str) -> str:
     job_name = init_job_name(slug, env)
     pods = kubectl_get_list_json(ODOO_NAMESPACE, "pods", f"job-name={job_name}")
@@ -1717,6 +1727,108 @@ def kubectl_wait(kind: str, name: str, timeout: str = "600s"):
     )
 
 
+def submit_backup_cleanup_job(*, purge_all: bool, retention_days: int) -> str:
+    secret = kubectl_get_json(ODOO_NAMESPACE, "secret", "nexora-s3")
+    if not secret:
+        raise RuntimeError("Missing nexora-s3 secret in odoo-system.")
+
+    safe_retention = max(1, min(3650, int(retention_days)))
+    ts = int(time.time())
+    job_name = f"nexora-backup-cleanup-{ts}"
+    if len(job_name) > 63:
+        job_name = job_name[:63].rstrip("-")
+
+    if purge_all:
+        script = """
+set -eu
+root_prefix="${S3_PREFIX:-backups}"
+aws --endpoint-url "$S3_ENDPOINT" \
+  s3 rm "s3://${S3_BUCKET}/${root_prefix}/" \
+  --region "$S3_REGION" \
+  --recursive >/dev/null || true
+echo "Purged all backup objects under s3://${S3_BUCKET}/${root_prefix}/"
+""".strip()
+    else:
+        script = f"""
+set -eu
+retention_days="{safe_retention}"
+cutoff=$(date -u -d "-${{retention_days}} days" +%Y%m%dT%H%M%SZ)
+root_prefix="${{S3_PREFIX:-backups}}"
+aws --endpoint-url "$S3_ENDPOINT" \
+  s3 ls "s3://${{S3_BUCKET}}/${{root_prefix}}/" \
+  --region "$S3_REGION" \
+  | awk '{{print $2}}' \
+  | sed 's:/$::' \
+  | awk '/^[0-9]{{8}}T[0-9]{{6}}Z$/' \
+  | while read -r dir; do
+      if [ "$dir" \\< "$cutoff" ]; then
+        aws --endpoint-url "$S3_ENDPOINT" \
+          s3 rm "s3://${{S3_BUCKET}}/${{root_prefix}}/${{dir}}/" \
+          --region "$S3_REGION" \
+          --recursive >/dev/null || true
+      fi
+    done
+echo "Purged backups older than $retention_days day(s) under s3://${{S3_BUCKET}}/${{root_prefix}}/"
+""".strip()
+
+    manifest = f"""
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {job_name}
+  namespace: {ODOO_NAMESPACE}
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: cleanup
+          image: amazon/aws-cli:2.15.49
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: S3_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-s3
+                  key: endpoint
+            - name: S3_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-s3
+                  key: bucket
+            - name: S3_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-s3
+                  key: region
+            - name: S3_PREFIX
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-s3
+                  key: prefix
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-s3
+                  key: access_key_id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-s3
+                  key: secret_access_key
+          command:
+            - /bin/sh
+            - -c
+            - |
+{chr(10).join("              " + line for line in script.splitlines())}
+""".strip() + "\n"
+
+    kubectl_apply(manifest)
+    return job_name
+
+
 def run_filestore_job(name: str, src_pvc: str, dst_pvc: str, command: str):
     manifest = f"""
 apiVersion: batch/v1
@@ -2163,15 +2275,57 @@ def delete_env(slug: str, env: str, domain_hosts: Optional[list[str]] = None):
 
     for host in sorted(all_domain_hosts):
         ingress_name = ingress_name_for_domain(name, host)
-        kubectl_delete("ingress", ingress_name, wait=False)
+        try:
+            kubectl_delete("ingress", ingress_name, wait=False)
+        except Exception:
+            pass
 
-    kubectl_delete("ingress", name, wait=False)
-    kubectl_delete("service", name, wait=False)
-    kubectl_delete("deployment", name, wait=False)
-    kubectl_delete("secret", cfg_secret, wait=False)
-    kubectl_delete("pvc", pvc_name, wait=False)
+    for kind, resource_name in [
+        ("ingress", name),
+        ("service", name),
+        ("deployment", name),
+        ("secret", cfg_secret),
+        ("pvc", pvc_name),
+    ]:
+        try:
+            kubectl_delete(kind, resource_name, wait=False)
+        except Exception:
+            pass
 
-    drop_db(db_name_for(slug, env))
+    try:
+        drop_db(db_name_for(slug, env))
+    except Exception:
+        pass
+
+
+def cleanup_project_slug_artifacts(slug: str, env_domains: Optional[dict[str, list[str]]] = None):
+    safe_slug = (slug or "").strip().lower()
+    if not safe_slug or not SLUG_RE.match(safe_slug):
+        return
+
+    domains_by_env = env_domains or {}
+    for env_name in ["dev", "staging", "prod"]:
+        try:
+            delete_env(safe_slug, env_name, domains_by_env.get(env_name) or [])
+        except Exception:
+            # Best-effort cleanup.
+            pass
+
+    selector = f"app=odoo,project={safe_slug}"
+    for singular, plural in [
+        ("ingress", "ingresses"),
+        ("service", "services"),
+        ("deployment", "deployments"),
+        ("secret", "secrets"),
+        ("pvc", "persistentvolumeclaims"),
+        ("job", "jobs"),
+    ]:
+        names = kubectl_names_by_selector(ODOO_NAMESPACE, plural, selector)
+        for name in names:
+            try:
+                kubectl_delete(singular, name, wait=False)
+            except Exception:
+                pass
 
 
 def set_env_status(project_id: int, env_name: str, status: str, error: str = ""):
@@ -2239,12 +2393,29 @@ def spawn_project_delete(project_id: int):
 
 def spawn_orphan_cleanup(slug: str, env_domains: dict[str, list[str]]):
     def _worker():
-        for env_name in sorted({*["dev", "staging", "prod"], *env_domains.keys()}):
-            hosts = env_domains.get(env_name) or []
+        cleanup_project_slug_artifacts(slug, env_domains)
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+
+
+def spawn_maintenance_cleanup(
+    *,
+    slugs: list[str],
+    backups_mode: str = "none",
+    backup_retention_days: int = 2,
+):
+    def _worker():
+        for slug in slugs:
+            cleanup_project_slug_artifacts(slug)
+
+        if backups_mode in {"purge_all", "retention"}:
             try:
-                delete_env(slug, env_name, hosts)
+                submit_backup_cleanup_job(
+                    purge_all=(backups_mode == "purge_all"),
+                    retention_days=backup_retention_days,
+                )
             except Exception:
-                # Best-effort cleanup for force-delete mode.
                 pass
 
     thread = threading.Thread(target=_worker, daemon=True)
@@ -2792,6 +2963,85 @@ def cleanup_stale_projects(request: Request):
     return redirect_with_notice(
         "/",
         f"Removed {removed} stale project(s) from dashboard. Cleanup continues in background.",
+    )
+
+
+@app.post("/admin/maintenance/purge-old")
+def admin_purge_old_artifacts(
+    request: Request,
+    backups_mode: str = Form("none"),
+    backup_retention_days: int = Form(2),
+):
+    user = current_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    if not user.is_admin:
+        return HTMLResponse("Forbidden", status_code=403)
+
+    selected_backups_mode = (backups_mode or "none").strip().lower()
+    if selected_backups_mode not in {"none", "retention", "purge_all"}:
+        selected_backups_mode = "none"
+    safe_retention = max(1, min(3650, int(backup_retention_days or 2)))
+
+    with db_session() as db:
+        live_slugs = {
+            (slug or "").strip().lower()
+            for (slug,) in db.query(Project.slug).all()
+            if slug
+        }
+        tombstoned_slugs = {
+            (slug or "").strip().lower()
+            for (slug,) in db.query(ProjectTombstone.slug).all()
+            if slug
+        }
+
+        stale_projects = db.query(Project).filter(Project.status.in_(["deleting", "delete_failed"])).all()
+        stale_slugs = set()
+        for project in stale_projects:
+            stale_slugs.add(project.slug)
+            upsert_project_tombstone(db, project.slug, "maintenance-purge")
+            db.delete(project)
+        db.commit()
+
+        current_project_ids = [pid for (pid,) in db.query(Project.id).all() if pid is not None]
+        if current_project_ids:
+            db.query(BuildEvent).filter(
+                ~BuildEvent.project_id.in_(current_project_ids)
+            ).delete(synchronize_session=False)
+        else:
+            db.query(BuildEvent).delete(synchronize_session=False)
+        db.commit()
+
+    orphan_slugs = set()
+    try:
+        discovered = discover_cluster_projects()
+        orphan_slugs = {slug for slug in discovered.keys() if slug not in live_slugs}
+    except Exception:
+        orphan_slugs = set()
+
+    cleanup_slugs = sorted(
+        {
+            slug
+            for slug in {*(tombstoned_slugs | stale_slugs | orphan_slugs)}
+            if slug and SLUG_RE.match(slug)
+        }
+    )
+
+    spawn_maintenance_cleanup(
+        slugs=cleanup_slugs,
+        backups_mode=selected_backups_mode,
+        backup_retention_days=safe_retention,
+    )
+
+    backup_part = "without backup cleanup"
+    if selected_backups_mode == "purge_all":
+        backup_part = "and purging ALL backup snapshots"
+    elif selected_backups_mode == "retention":
+        backup_part = f"and purging backup snapshots older than {safe_retention} day(s)"
+
+    return redirect_with_notice(
+        "/",
+        f"Maintenance cleanup started for {len(cleanup_slugs)} project slug(s), {backup_part}. 404 on deleted subdomains is expected.",
     )
 
 

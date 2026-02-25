@@ -76,6 +76,27 @@
 </div>
 {% endif %}
 
+{% if user and user.is_admin %}
+<div class="card" style="margin-bottom:16px;">
+  <div class="project-title" style="font-size:16px; margin-bottom:8px;">Maintenance</div>
+  <div class="muted" style="font-size:12px; margin-bottom:10px;">
+    Use this to purge orphan resources for old deleted projects. Deleted project URLs may still show nginx `404` because wildcard DNS still points to the ingress controller; this is expected.
+  </div>
+  <div class="row">
+    <form method="post" action="/admin/maintenance/purge-old">
+      <input type="hidden" name="backups_mode" value="retention" />
+      <input type="hidden" name="backup_retention_days" value="2" />
+      <button class="btn" type="submit">Purge orphans + backups older than 2 days</button>
+    </form>
+    <form method="post" action="/admin/maintenance/purge-old">
+      <input type="hidden" name="backups_mode" value="purge_all" />
+      <input type="hidden" name="backup_retention_days" value="2" />
+      <button class="btn ghost danger" type="submit">Purge orphans + ALL backups</button>
+    </form>
+  </div>
+</div>
+{% endif %}
+
 {% if not projects %}
 <div class="card" style="margin-bottom:16px;">
   <div class="project-title">No Projects Yet</div>
