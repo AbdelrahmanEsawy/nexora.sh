@@ -529,6 +529,13 @@ def remove_project_tombstone(db, slug: str):
         db.delete(row)
 
 
+def request_host(request: Request) -> str:
+    raw = (request.headers.get("host") or "").strip().lower()
+    if not raw:
+        return ""
+    return raw.split(":", 1)[0]
+
+
 def redirect_with_error(path: str, message: str, extra: Optional[dict] = None):
     params = {"error": message}
     if extra:
@@ -541,6 +548,21 @@ def redirect_with_notice(path: str, message: str, extra: Optional[dict] = None):
     if extra:
         params.update(extra)
     return RedirectResponse(f"{path}?{urlencode(params)}", status_code=303)
+
+
+@app.middleware("http")
+async def deleted_subdomain_fallback(request: Request, call_next):
+    host = request_host(request)
+    app_host = f"app.{BASE_DOMAIN}".lower()
+    base = f".{BASE_DOMAIN}".lower()
+
+    # If a deleted/unknown project subdomain reaches control-plane fallback ingress,
+    # redirect users to app dashboard with an explicit message.
+    if host and host != app_host and host.endswith(base):
+        notice = "This project URL is deleted or inactive. Use app.nexora.red to create/open active projects."
+        return RedirectResponse(f"https://{app_host}/?{urlencode({'notice': notice})}", status_code=302)
+
+    return await call_next(request)
 
 
 def normalize_hosting_location(code: str) -> str:
