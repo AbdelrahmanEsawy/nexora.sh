@@ -12,6 +12,7 @@
       <div class="muted" style="font-size:12px;">We’ll redirect you once it’s ready.</div>
     </div>
   </div>
+  <div id="status-hint" class="muted" style="font-size:12px; margin-top:10px;"></div>
   <div style="margin-top:12px;">
     <div class="row" style="justify-content:space-between;">
       <span class="muted" style="font-size:12px;">Progress</span>
@@ -24,6 +25,7 @@
   <div class="spacer"></div>
   <div class="row">
     <a class="btn ghost" href="/projects/{{ project.id }}/settings">Back</a>
+    <a class="btn ghost" href="/projects/{{ project.id }}/settings?env={{ env_name }}&tab=logs#branch-workspace">View logs</a>
     <a id="open-btn" class="btn disabled" href="#" target="_blank" aria-disabled="true">Open when ready</a>
   </div>
 </div>
@@ -32,6 +34,7 @@
   (function () {
     const statusEl = document.getElementById("status-text");
     const openBtn = document.getElementById("open-btn");
+    const statusHint = document.getElementById("status-hint");
     const progressPercent = document.getElementById("progress-percent");
     const progressFill = document.getElementById("progress-fill");
     function setOpenReady(host) {
@@ -57,16 +60,22 @@
             window.location.href = `https://${data.host || "{{ env.host }}"}`;
             return;
           }
-          if (data.message && data.message.toLowerCase().includes("init failed")) {
+          const lower = (data.message || "").toLowerCase();
+          if (lower.includes("init failed")) {
             openBtn.textContent = "Blocked: initialization failed";
-          } else if (data.message && data.message.toLowerCase().includes("provisioning failed")) {
+            if (statusHint) statusHint.textContent = "Initialization failed. Open logs and retry redeploy/reset from workspace.";
+          } else if (lower.includes("provisioning failed")) {
             openBtn.textContent = "Blocked: provisioning failed";
-          } else if (data.message && data.message.toLowerCase().includes("runtime deployment missing")) {
+            if (statusHint) statusHint.textContent = "Provisioning failed. Check logs, then redeploy.";
+          } else if (lower.includes("runtime deployment missing")) {
             openBtn.textContent = "Blocked: runtime deployment missing";
-          } else if (data.message && data.message.toLowerCase().includes("tls")) {
+            if (statusHint) statusHint.textContent = "Runtime deployment is missing. Use redeploy from workspace.";
+          } else if (lower.includes("tls")) {
             openBtn.textContent = "Waiting for TLS";
+            if (statusHint) statusHint.textContent = "TLS is still being issued. This usually resolves shortly.";
           } else {
             openBtn.textContent = "Open when ready";
+            if (statusHint) statusHint.textContent = "";
           }
         }
       } catch (e) {}

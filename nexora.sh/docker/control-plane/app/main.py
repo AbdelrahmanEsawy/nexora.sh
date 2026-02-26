@@ -49,6 +49,11 @@ GITHUB_APP_SLUG = os.getenv("GITHUB_APP_SLUG", "nexora-platform")
 DEFAULT_DEV_BRANCH = os.getenv("DEFAULT_DEV_BRANCH", "dev")
 DEFAULT_STAGING_BRANCH = os.getenv("DEFAULT_STAGING_BRANCH", "staging")
 DEFAULT_PROD_BRANCH = os.getenv("DEFAULT_PROD_BRANCH", "main")
+ENV_NAMES = ("dev", "staging", "prod")
+ENV_NAME_SET = set(ENV_NAMES)
+ENV_STAGE_ORDER = {"prod": 0, "staging": 1, "dev": 2}
+ENV_STAGE_LABELS = {"prod": "Production", "staging": "Staging", "dev": "Development"}
+WORKSPACE_TAB_SET = {"open", "history", "logs", "backups"}
 DEFAULT_WORKERS = int(os.getenv("DEFAULT_WORKERS", "1"))
 DEFAULT_STORAGE_GB = int(os.getenv("DEFAULT_STORAGE_GB", "1"))
 DEFAULT_STAGING_SLOTS = int(os.getenv("DEFAULT_STAGING_SLOTS", "1"))
@@ -3948,6 +3953,57 @@ def spawn_env_redeploy(project_id: int, env_name: str):
     thread.start()
 
 
+def spawn_env_reset(project_id: int, env_name: str):
+    def _worker():
+        set_env_status(project_id, env_name, "provisioning", "")
+        record_build_event(
+            project_id,
+            env_name,
+            "",
+            "",
+            "resetting",
+            f"Resetting {env_name} environment",
+        )
+        try:
+            with db_session() as db:
+                project = db.query(Project).filter(Project.id == project_id).first()
+                if not project:
+                    return
+                env_obj = db.query(Environment).filter(
+                    Environment.project_id == project.id,
+                    Environment.name == env_name,
+                ).first()
+                if not env_obj:
+                    raise RuntimeError(f"{env_name} environment is not created yet.")
+                reset_env(project, env_name)
+                env_obj.status = "active"
+                env_obj.last_error = ""
+                db.commit()
+
+            set_env_status(project_id, env_name, "active", "")
+            record_build_event(
+                project_id,
+                env_name,
+                "",
+                "",
+                "reset",
+                f"{env_name} reset completed",
+            )
+        except Exception as exc:
+            set_env_status(project_id, env_name, "failed", str(exc))
+            record_build_event(
+                project_id,
+                env_name,
+                "",
+                "",
+                "failed",
+                f"{env_name} reset failed: {str(exc)[:180]}",
+            )
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+
+
 def ensure_target_env_exists(db, project: Project, envs: dict[str, Environment], source_env: str, target_env: str):
     if target_env in envs:
         return envs[target_env]
@@ -4838,6 +4894,10 @@ def ensure_project_mutable(project: Project, path: str):
     return None
 
 
+def stage_label(env_name: str) -> str:
+    return ENV_STAGE_LABELS.get((env_name or "").strip().lower(), (env_name or "").strip().title())
+
+
 @app.get("/projects/{project_id}/settings", response_class=HTMLResponse)
 def project_settings(request: Request, project_id: int):
     user = current_user(request)
@@ -4849,11 +4909,13 @@ def project_settings(request: Request, project_id: int):
     error = request.query_params.get("error")
     notice = request.query_params.get("notice")
     selected_env = (request.query_params.get("env") or "").strip().lower()
-    selected_tab = (request.query_params.get("tab") or "history").strip().lower()
-    if selected_tab == "settings":
+    selected_tab = (request.query_params.get("tab") or "open").strip().lower()
+    selected_tab = {
+        "settings": "open",
+        "workspace": "open",
+    }.get(selected_tab, selected_tab)
+    if selected_tab not in WORKSPACE_TAB_SET:
         selected_tab = "open"
-    if selected_tab not in {"history", "logs", "backups", "open"}:
-        selected_tab = "history"
     hosting_locations, hosting_location_map, _ = hosting_catalog()
     if github_app_enabled():
         try:
@@ -4865,11 +4927,10 @@ def project_settings(request: Request, project_id: int):
         if not project:
             return HTMLResponse("Not found", status_code=404)
         db.refresh(project)
-        env_order = {"prod": 0, "staging": 1, "dev": 2}
-        project.envs.sort(key=lambda e: env_order.get(e.name, 99))
+        project.envs.sort(key=lambda e: ENV_STAGE_ORDER.get(e.name, 99))
         env_by_name = {e.name: e for e in project.envs}
-        if selected_env not in {"dev", "staging", "prod"}:
-            for fallback in ("dev", "staging", "prod"):
+        if selected_env not in ENV_NAME_SET:
+            for fallback in ENV_NAMES:
                 if fallback in env_by_name:
                     selected_env = fallback
                     break
@@ -4980,6 +5041,12 @@ def project_settings(request: Request, project_id: int):
             env_status.get(selected_env) or {},
             latest_env_event,
         )
+        selected_stage_label = stage_label(selected_env)
+        selected_env_busy = bool(
+            selected_env_obj
+            and ((selected_env_obj.status or "").strip().lower() in {"provisioning"})
+        )
+
         if selected_tab == "logs":
             if selected_env_obj:
                 branch_logs = env_logs_tail(project.slug, selected_env, lines=260)
@@ -5013,6 +5080,8 @@ def project_settings(request: Request, project_id: int):
                 "selected_env": selected_env,
                 "selected_tab": selected_tab,
                 "selected_env_obj": selected_env_obj,
+                "selected_stage_label": selected_stage_label,
+                "selected_env_busy": selected_env_busy,
                 "branch_logs": branch_logs,
                 "backup_items": backup_items,
                 "workspace_progress": workspace_progress,
@@ -5020,6 +5089,7 @@ def project_settings(request: Request, project_id: int):
                 "error": error,
                 "notice": notice,
                 "env_status": env_status,
+                "stage_labels": ENV_STAGE_LABELS,
                 "hosting_locations": hosting_locations,
                 "hosting_location_map": hosting_location_map,
             },
@@ -5031,7 +5101,7 @@ def project_env_status(request: Request, project_id: int, env_name: str):
     user = current_user(request)
     if not user:
         return JSONResponse({"ready": False, "message": "Unauthorized"}, status_code=401)
-    if env_name not in {"dev", "staging", "prod"}:
+    if env_name not in ENV_NAME_SET:
         return JSONResponse({"ready": False, "message": "Invalid environment"}, status_code=400)
 
     with db_session() as db:
@@ -5080,7 +5150,7 @@ def project_env_open(request: Request, project_id: int, env_name: str):
     user = current_user(request)
     if not user:
         return RedirectResponse("/login")
-    if env_name not in {"dev", "staging", "prod"}:
+    if env_name not in ENV_NAME_SET:
         return HTMLResponse("Invalid environment", status_code=400)
 
     with db_session() as db:
@@ -5373,7 +5443,7 @@ def promote_project_env(
     if not user:
         return RedirectResponse("/login")
 
-    if source_env not in {"dev", "staging", "prod"} or target_env not in {"dev", "staging", "prod"}:
+    if source_env not in ENV_NAME_SET or target_env not in ENV_NAME_SET:
         return redirect_with_error(f"/projects/{project_id}/settings", "Invalid environment.")
     if source_env == target_env:
         return redirect_with_error(f"/projects/{project_id}/settings", "Invalid promotion.")
@@ -5434,7 +5504,7 @@ def transfer_branch_workspace(
     source_env = (source_env or "").strip().lower()
     target_env = (target_env or "").strip().lower()
     mode = (mode or "copy").strip().lower()
-    if source_env not in {"dev", "staging", "prod"} or target_env not in {"dev", "staging", "prod"}:
+    if source_env not in ENV_NAME_SET or target_env not in ENV_NAME_SET:
         return redirect_with_error(f"/projects/{project_id}/settings", "Invalid environment.")
     if source_env == target_env:
         return redirect_with_error(f"/projects/{project_id}/settings", "Source and target are the same.")
@@ -5472,6 +5542,15 @@ def transfer_branch_workspace(
                 f"Source environment '{source_env}' is {source_state}.",
                 {"env": source_env, "tab": "history"},
             )
+        target_obj = envs.get(target_env)
+        if target_obj:
+            target_state = (target_obj.status or "").strip().lower()
+            if target_state == "provisioning":
+                return redirect_with_notice(
+                    f"/projects/{project_id}/settings",
+                    f"Target environment '{target_env}' is still provisioning. Retry once it becomes active.",
+                    {"env": target_env, "tab": "history"},
+                )
 
     spawn_env_transfer(project_id, source_env, target_env, mode=mode, trigger="drag-drop")
     notice = f"Copy started: {source_env} → {target_env}"
@@ -5501,7 +5580,7 @@ def create_backup_manual(
     source = (source or "manual").strip().lower()
     if source not in {"manual", "daily"}:
         source = "manual"
-    if env not in {"dev", "staging", "prod"}:
+    if env not in ENV_NAME_SET:
         return redirect_with_error(f"/projects/{project_id}/settings", "Invalid environment.")
 
     with db_session() as db:
@@ -5558,7 +5637,7 @@ def import_backup_reference(
         return RedirectResponse("/login")
     env = (env or "").strip().lower()
     object_path = (object_path or "").strip().strip("/")
-    if env not in {"dev", "staging", "prod"}:
+    if env not in ENV_NAME_SET:
         return redirect_with_error(f"/projects/{project_id}/settings", "Invalid environment.")
     if not object_path:
         return redirect_with_error(
@@ -5627,7 +5706,7 @@ def restore_backup_manual(
                 "Backup not found.",
             )
         env_name = (backup.env or "").strip().lower()
-        if env_name not in {"dev", "staging", "prod"}:
+        if env_name not in ENV_NAME_SET:
             return redirect_with_error(
                 f"/projects/{project_id}/settings",
                 "Backup environment is invalid.",
@@ -5760,25 +5839,38 @@ def reset_project_env(
     if env not in {"dev"}:
         return redirect_with_error(f"/projects/{project_id}/settings", "Only dev can be reset.")
 
-    try:
-        with db_session() as db:
-            project = get_project_for_user(db, user, project_id)
-            if not project:
-                return HTMLResponse("Not found", status_code=404)
-            locked = ensure_project_mutable(project, f"/projects/{project_id}/settings")
-            if locked:
-                return locked
+    with db_session() as db:
+        project = get_project_for_user(db, user, project_id)
+        if not project:
+            return HTMLResponse("Not found", status_code=404)
+        locked = ensure_project_mutable(project, f"/projects/{project_id}/settings")
+        if locked:
+            return locked
+        env_obj = db.query(Environment).filter(
+            Environment.project_id == project.id,
+            Environment.name == env,
+        ).first()
+        if not env_obj:
+            return redirect_with_error(
+                f"/projects/{project_id}/settings",
+                "Development environment is not created yet.",
+                {"env": "dev", "tab": "history"},
+            )
+        if (env_obj.status or "").strip().lower() == "provisioning":
+            return redirect_with_notice(
+                f"/projects/{project_id}/settings",
+                "Development environment is already provisioning.",
+                {"env": "dev", "tab": "history"},
+            )
+        env_obj.last_error = ""
+        db.commit()
 
-            reset_env(project, env)
-            set_env_status(project.id, env, "active", "")
-            record_build_event(project.id, env, "", "", "reset", "Dev reset")
-    except Exception as exc:
-        return redirect_with_error(
-            f"/projects/{project_id}/settings",
-            f"Reset failed: {str(exc)[:200]}",
-        )
-
-    return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
+    spawn_env_reset(project_id, env)
+    return redirect_with_notice(
+        f"/projects/{project_id}/settings",
+        "Dev reset started.",
+        {"env": "dev", "tab": "history"},
+    )
 
 
 @app.post("/projects/{project_id}/reset-from-prod")
@@ -5796,55 +5888,41 @@ def reset_project_env_from_prod(
             "Only dev or staging can be reset from prod.",
         )
 
-    try:
-        with db_session() as db:
-            project = get_project_for_user(db, user, project_id)
-            if not project:
-                return HTMLResponse("Not found", status_code=404)
-            locked = ensure_project_mutable(project, f"/projects/{project_id}/settings")
-            if locked:
-                return locked
+    with db_session() as db:
+        project = get_project_for_user(db, user, project_id)
+        if not project:
+            return HTMLResponse("Not found", status_code=404)
+        locked = ensure_project_mutable(project, f"/projects/{project_id}/settings")
+        if locked:
+            return locked
 
-            envs = {e.name: e for e in project.envs}
-            if "prod" not in envs:
-                return redirect_with_error(
-                    f"/projects/{project_id}/settings",
-                    "Production environment missing. Create prod first.",
-                )
+        envs = {e.name: e for e in project.envs}
+        if "prod" not in envs:
+            return redirect_with_error(
+                f"/projects/{project_id}/settings",
+                "Production environment missing. Create prod first.",
+            )
+        prod_state = (envs["prod"].status or "").strip().lower()
+        if prod_state in {"provisioning", "failed"}:
+            return redirect_with_error(
+                f"/projects/{project_id}/settings",
+                f"Production environment is {prod_state}. Wait until it becomes active.",
+                {"env": "prod", "tab": "history"},
+            )
+        target_obj = envs.get(target_env)
+        if target_obj and (target_obj.status or "").strip().lower() == "provisioning":
+            return redirect_with_notice(
+                f"/projects/{project_id}/settings",
+                f"{target_env} environment is already provisioning.",
+                {"env": target_env, "tab": "history"},
+            )
 
-            if target_env not in envs:
-                prod_settings = effective_env_settings(project, envs["prod"])
-                temp_env = Environment(
-                    workers=prod_settings["workers"],
-                    storage_gb=prod_settings["storage_gb"],
-                    odoo_version=prod_settings["odoo_version"],
-                )
-                host, db_name = provision_env(project, target_env, temp_env)
-                env_obj = Environment(
-                    project_id=project.id,
-                    name=target_env,
-                    host=host,
-                    db_name=db_name,
-                    workers=prod_settings["workers"],
-                    storage_gb=prod_settings["storage_gb"],
-                    odoo_version=prod_settings["odoo_version"],
-                    status="active",
-                    last_error="",
-                )
-                db.add(env_obj)
-                db.commit()
-                db.refresh(env_obj)
-
-            reset_from_prod(project, target_env)
-            set_env_status(project.id, target_env, "active", "")
-            record_build_event(project.id, target_env, "", "", "reset", f"Reset {target_env} from prod")
-    except Exception as exc:
-        return redirect_with_error(
-            f"/projects/{project_id}/settings",
-            f"Reset from prod failed: {str(exc)[:200]}",
-        )
-
-    return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
+    spawn_env_transfer(project_id, "prod", target_env, mode="copy", trigger="button-reset-from-prod")
+    return redirect_with_notice(
+        f"/projects/{project_id}/settings",
+        f"Reset from prod started: prod → {target_env}.",
+        {"env": target_env, "tab": "history"},
+    )
 
 
 @app.post("/projects/{project_id}/envs/create")
@@ -5879,7 +5957,11 @@ def create_env_manual(
             Environment.name == env,
         ).first()
         if env_obj and env_obj.status == "provisioning":
-            return RedirectResponse(f"/projects/{project_id}/settings#env-{env}", status_code=303)
+            return redirect_with_notice(
+                f"/projects/{project_id}/settings",
+                f"{env} environment is already provisioning.",
+                {"env": env, "tab": "history"},
+            )
         if env_obj and env_obj.status == "active":
             return redirect_with_error(
                 f"/projects/{project_id}/settings",
@@ -5905,7 +5987,11 @@ def create_env_manual(
         db.commit()
 
     spawn_env_provision(project_id, env)
-    return RedirectResponse(f"/projects/{project_id}/settings#env-{env}", status_code=303)
+    return redirect_with_notice(
+        f"/projects/{project_id}/settings",
+        f"{env} provisioning started.",
+        {"env": env, "tab": "history"},
+    )
 
 
 @app.post("/projects/{project_id}/envs/restart")
@@ -5917,7 +6003,7 @@ def restart_env_manual(
     user = current_user(request)
     if not user:
         return RedirectResponse("/login")
-    if env not in {"dev", "staging", "prod"}:
+    if env not in ENV_NAME_SET:
         return redirect_with_error(f"/projects/{project_id}/settings", "Invalid environment.")
 
     with db_session() as db:
@@ -5935,6 +6021,12 @@ def restart_env_manual(
             return redirect_with_error(
                 f"/projects/{project_id}/settings",
                 f"{env} environment is not created yet.",
+                {"env": env, "tab": "history"},
+            )
+        if (env_obj.status or "").strip().lower() == "provisioning":
+            return redirect_with_notice(
+                f"/projects/{project_id}/settings",
+                f"{env} is provisioning. Wait until active before restart.",
                 {"env": env, "tab": "history"},
             )
         env_obj.last_error = ""
@@ -5957,7 +6049,7 @@ def redeploy_env_manual(
     user = current_user(request)
     if not user:
         return RedirectResponse("/login")
-    if env not in {"dev", "staging", "prod"}:
+    if env not in ENV_NAME_SET:
         return redirect_with_error(f"/projects/{project_id}/settings", "Invalid environment.")
     try:
         ensure_prereqs()
@@ -5979,6 +6071,12 @@ def redeploy_env_manual(
             return redirect_with_error(
                 f"/projects/{project_id}/settings",
                 f"{env} environment is not created yet.",
+                {"env": env, "tab": "history"},
+            )
+        if (env_obj.status or "").strip().lower() == "provisioning":
+            return redirect_with_notice(
+                f"/projects/{project_id}/settings",
+                f"{env} redeploy is already in progress.",
                 {"env": env, "tab": "history"},
             )
         env_obj.status = "provisioning"
