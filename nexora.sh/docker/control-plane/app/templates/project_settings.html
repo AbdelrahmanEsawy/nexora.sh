@@ -210,8 +210,11 @@
       <input class="input" type="number" min="1" name="staging_slots" value="{{ project.staging_slots or 1 }}" />
     </div>
     <div>
-      <div class="muted" style="font-size:12px; margin-bottom:6px;">Odoo version (community)</div>
+      <div class="muted" style="font-size:12px; margin-bottom:6px;">Odoo version or image</div>
       <input class="input" name="odoo_version" value="{{ project.odoo_version or '19.0' }}" />
+      <div class="muted" style="font-size:11px; margin-top:6px;">
+        Use <code>19.0</code> for stock image, or a full image like <code>ghcr.io/abdelrahmanesawy/nexora-odoo-core:19.0-custom</code> for core-modified builds.
+      </div>
     </div>
   </div>
 

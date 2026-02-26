@@ -2364,10 +2364,15 @@ def db_name_for(slug: str, env: str) -> str:
 
 
 def odoo_image_for_version(version: str) -> str:
-    version = version or DEFAULT_ODOO_VERSION
-    if version.startswith("odoo:"):
-        return version
-    return f"odoo:{version}"
+    raw = (version or DEFAULT_ODOO_VERSION or "").strip()
+    if not raw:
+        raw = DEFAULT_ODOO_VERSION
+    # Allow full image references for custom core builds (for example ghcr.io/org/odoo-core:19.0-custom).
+    if "/" in raw:
+        return raw
+    if raw.startswith("odoo:"):
+        return raw
+    return f"odoo:{raw}"
 
 
 def effective_env_settings(project: Project, env_obj: Optional["Environment"] = None) -> dict:

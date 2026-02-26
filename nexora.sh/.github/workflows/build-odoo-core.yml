@@ -1,0 +1,57 @@
+name: Build and Push Custom Odoo Core
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "odoo-core/**"
+      - ".github/workflows/build-odoo-core.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect source tree
+        id: check_source
+        run: |
+          if [[ -d odoo-core/src/odoo && -d odoo-core/src/addons ]]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip build (source not initialized)
+        if: steps.check_source.outputs.ready != 'true'
+        run: echo "Skipping custom core image build. Run ./scripts/bootstrap_odoo_core.sh and commit odoo-core/src changes."
+
+      - name: Set up Docker Buildx
+        if: steps.check_source.outputs.ready == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.check_source.outputs.ready == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push custom Odoo core image
+        if: steps.check_source.outputs.ready == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./odoo-core
+          file: ./odoo-core/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/nexora-odoo-core:19.0-custom
+            ghcr.io/${{ github.repository_owner }}/nexora-odoo-core:latest
