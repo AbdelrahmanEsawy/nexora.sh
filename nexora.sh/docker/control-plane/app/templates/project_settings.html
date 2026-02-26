@@ -11,6 +11,27 @@
       grid-template-columns: 1fr !important;
     }
   }
+  .stage-block {
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 12px;
+    margin-bottom: 10px;
+    padding: 10px;
+    background: rgba(11,18,32,0.55);
+  }
+  .stage-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+  }
+  .stage-title {
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.2px;
+  }
+  .branch-slot {
+    width: 100%;
+  }
   .branch-slot.drop-target {
     border-color: rgba(34,211,238,0.65) !important;
     box-shadow: 0 0 0 2px rgba(34,211,238,0.2) inset;
@@ -19,9 +40,25 @@
     opacity: 0.7;
     transform: scale(0.99);
   }
-  .branch-row {
-    gap: 6px;
-    margin-bottom: 8px;
+  .branch-line {
+    min-height: 56px;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .branch-line-main {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 3px;
+  }
+  .branch-name {
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .branch-db {
+    font-size: 10px;
+    color: var(--muted);
+    opacity: 0.9;
   }
 </style>
 <div class="card" style="margin-bottom:16px;">
@@ -171,42 +208,46 @@
 
 <div class="grid branch-layout" style="grid-template-columns: 250px 1fr; align-items:start; gap:14px;">
   <aside class="card" id="branches">
-    <div class="row" style="justify-content:space-between; margin-bottom:10px;">
-      <div>
-        <div class="project-title">Branches</div>
-        <div class="muted" style="font-size:12px;">Drag source branch to target stage.</div>
-      </div>
-      <button class="btn ghost" type="button" id="branch-dup-toggle" style="padding:8px 12px;">+ Duplicate</button>
+    <div class="project-title" style="margin-bottom:4px;">Branches</div>
+    <div class="muted" style="font-size:12px; margin-bottom:10px;">
+      Fixed stages like Odoo.sh. Drag branch line between stages to move/merge. Drop on Development resets dev DB.
     </div>
-    {% for env_name in ["dev", "staging", "prod"] %}
+    {% for env_name in ["prod", "staging", "dev"] %}
       {% set env_obj = (project.envs | selectattr("name","equalto", env_name) | list | first) %}
       {% set status = env_status.get(env_name) %}
       {% set env_branch = project.dev_branch if env_name == "dev" else (project.staging_branch if env_name == "staging" else project.prod_branch) %}
-      <div class="row branch-row">
+      {% set stage_label = "Development" if env_name == "dev" else ("Staging" if env_name == "staging" else "Production") %}
+      <div class="stage-block">
+        <div class="stage-header">
+          <div class="stage-title">{{ stage_label }}</div>
+          <button
+            type="button"
+            class="btn ghost branch-plus"
+            data-target-env="{{ env_name }}"
+            title="Duplicate into {{ stage_label }}"
+            style="padding:8px 11px;"
+          >+</button>
+        </div>
         <a
-          class="btn env-card branch-slot {% if selected_env == env_name %}primary{% else %}ghost{% endif %}"
+          class="btn env-card branch-slot branch-line {% if selected_env == env_name %}primary{% else %}ghost{% endif %}"
           href="/projects/{{ project.id }}/settings?env={{ env_name }}&tab={{ selected_tab }}#branch-workspace"
           data-env="{{ env_name }}"
           data-exists="{{ 1 if env_obj else 0 }}"
           draggable="{{ 'true' if env_obj else 'false' }}"
-          title="{% if env_obj %}Drag this branch to another stage{% else %}Create this stage first{% endif %}"
-          style="flex:1; justify-content:space-between;"
+          title="{% if env_obj %}Drag this branch line to another stage{% else %}Drop here to create and copy/reset{% endif %}"
         >
-          <span style="display:flex; flex-direction:column; align-items:flex-start; gap:3px;">
-            <span class="env-pill" style="{% if selected_env == env_name %}background:rgba(11,15,26,0.2); color:#0b0f1a; border-color:rgba(11,15,26,0.2);{% endif %}">{{ env_name }}</span>
-            <span class="muted" style="font-size:10px; {% if selected_env == env_name %}color:#0b0f1a; opacity:0.75;{% endif %}">{{ env_branch or env_name }}</span>
+          <span class="branch-line-main">
+            <span class="branch-name" style="{% if selected_env == env_name %}color:#0b0f1a;{% endif %}">
+              {{ env_branch or env_name }}
+            </span>
+            <span class="branch-db" style="{% if selected_env == env_name %}color:#0b0f1a; opacity:0.75;{% endif %}">
+              {{ env_obj.db_name if env_obj else "Database not created yet" }}
+            </span>
           </span>
           <span class="muted" style="font-size:11px; {% if selected_env == env_name %}color:#0b0f1a; opacity:0.8;{% endif %}">
             {% if env_obj %}{{ status.message if status else 'Unknown' }}{% else %}Not created{% endif %}
           </span>
         </a>
-        <button
-          type="button"
-          class="btn ghost branch-plus"
-          data-target-env="{{ env_name }}"
-          title="Duplicate into {{ env_name }}"
-          style="padding:10px 12px;"
-        >+</button>
       </div>
     {% endfor %}
 
@@ -217,16 +258,20 @@
     </form>
 
     <div id="branch-dup-panel" class="card" style="display:none; margin-top:10px; padding:12px; background:#0b1220; border-color:rgba(255,255,255,0.08); box-shadow:none;">
-      <div class="project-title" style="font-size:14px; margin-bottom:8px;">Duplicate Branch</div>
+      <div class="project-title" style="font-size:14px; margin-bottom:8px;">Fork / Duplicate Branch</div>
       <form id="branch-dup-form" method="post" action="/projects/{{ project.id }}/branches/transfer">
         <input type="hidden" name="target_env" id="dup-target-env" value="{{ selected_env }}" />
         <input type="hidden" name="mode" value="copy" />
-        <div id="dup-target-label" class="muted" style="font-size:12px; margin-bottom:8px;">Target: {{ selected_env }}</div>
+        <div id="dup-target-label" class="muted" style="font-size:12px; margin-bottom:8px;">
+          Target stage: {{ "Development" if selected_env == "dev" else ("Staging" if selected_env == "staging" else "Production") }}
+        </div>
         <select class="input" name="source_env" id="dup-source-env" style="margin-bottom:8px;" required>
           {% for source_name in ["dev", "staging", "prod"] %}
             {% set source_obj = (project.envs | selectattr("name","equalto", source_name) | list | first) %}
             {% if source_obj %}
-              <option value="{{ source_name }}">{{ source_name }}</option>
+              {% set source_branch = project.dev_branch if source_name == "dev" else (project.staging_branch if source_name == "staging" else project.prod_branch) %}
+              {% set source_stage = "Development" if source_name == "dev" else ("Staging" if source_name == "staging" else "Production") %}
+              <option value="{{ source_name }}">{{ source_stage }} · {{ source_branch or source_name }}</option>
             {% endif %}
           {% endfor %}
         </select>
@@ -307,8 +352,9 @@
     </div>
 
     <div class="muted" style="font-size:12px; margin-bottom:10px;">
-      Branch operations are managed from the left panel: drag and drop to copy/move between stages, or use <code>+ Duplicate</code>.
-      Dropping onto <code>dev</code> resets dev from the source branch; dropping onto <code>prod</code> performs a live move.
+      Manage stages from the left panel only. Drag the branch/database line to move/merge between
+      <code>Production</code>, <code>Staging</code>, and <code>Development</code>.
+      Drop on <code>Development</code> resets dev from source; drop on <code>Production</code> starts live move.
     </div>
 
     <div class="row" style="margin-bottom:12px; gap:8px;">
@@ -382,6 +428,7 @@
   const dndSource = document.getElementById("dnd-source-env");
   const dndTarget = document.getElementById("dnd-target-env");
   const dndMode = document.getElementById("dnd-mode");
+  const stageNames = { prod: "Production", staging: "Staging", dev: "Development" };
   let dragSourceEnv = "";
   let isDragging = false;
 
@@ -449,12 +496,12 @@
       }
 
       let mode = "copy";
-      let question = `Copy ${dragSourceEnv} to ${targetEnv}?`;
+      let question = `Copy ${stageNames[dragSourceEnv] || dragSourceEnv} to ${stageNames[targetEnv] || targetEnv}?`;
       if (targetEnv === "dev") {
-        question = `Reset dev from ${dragSourceEnv}? This overwrites dev database and filestore.`;
+        question = `Reset Development from ${stageNames[dragSourceEnv] || dragSourceEnv}? This overwrites dev database and filestore.`;
       } else if (targetEnv === "prod") {
         mode = "move";
-        question = `Move ${dragSourceEnv} to prod (live)? Source branch will be reset after move.`;
+        question = `Move/Merge ${stageNames[dragSourceEnv] || dragSourceEnv} to Production (live)? Source stage will be reset after move.`;
       }
       if (!window.confirm(question)) {
         return;
@@ -464,7 +511,6 @@
   });
 
   const dupPanel = document.getElementById("branch-dup-panel");
-  const dupToggle = document.getElementById("branch-dup-toggle");
   const dupCancel = document.getElementById("branch-dup-cancel");
   const dupForm = document.getElementById("branch-dup-form");
   const dupTargetInput = document.getElementById("dup-target-env");
@@ -479,7 +525,7 @@
     }
     dupTargetInput.value = targetEnv;
     if (dupTargetLabel) {
-      dupTargetLabel.textContent = `Target: ${targetEnv}`;
+      dupTargetLabel.textContent = `Target stage: ${stageNames[targetEnv] || targetEnv}`;
     }
 
     const options = Array.from(dupSourceSelect.options);
@@ -496,9 +542,6 @@
     dupSourceSelect.focus();
   };
 
-  if (dupToggle) {
-    dupToggle.addEventListener("click", () => openDuplicatePanel(defaultTarget));
-  }
   plusButtons.forEach((btn) => {
     btn.addEventListener("click", () => {
       openDuplicatePanel(btn.dataset.targetEnv || defaultTarget);
