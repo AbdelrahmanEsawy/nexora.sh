@@ -3378,6 +3378,140 @@ def spawn_env_redeploy(project_id: int, env_name: str):
     thread.start()
 
 
+def ensure_target_env_exists(db, project: Project, envs: dict[str, Environment], source_env: str, target_env: str):
+    if target_env in envs:
+        return envs[target_env]
+    source_settings = effective_env_settings(project, envs[source_env])
+    temp_env = Environment(
+        workers=source_settings["workers"],
+        storage_gb=source_settings["storage_gb"],
+        odoo_version=source_settings["odoo_version"],
+    )
+    host, db_name = provision_env(project, target_env, temp_env)
+    env_obj = Environment(
+        project_id=project.id,
+        name=target_env,
+        host=host,
+        db_name=db_name,
+        workers=source_settings["workers"],
+        storage_gb=source_settings["storage_gb"],
+        odoo_version=source_settings["odoo_version"],
+        status="active",
+        last_error="",
+    )
+    db.add(env_obj)
+    db.commit()
+    db.refresh(env_obj)
+    envs[target_env] = env_obj
+    return env_obj
+
+
+def spawn_env_transfer(
+    project_id: int,
+    source_env: str,
+    target_env: str,
+    *,
+    mode: str = "copy",
+    trigger: str = "manual",
+):
+    normalized_mode = "move" if mode == "move" else "copy"
+
+    def _worker():
+        if target_env not in {"dev", "staging", "prod"}:
+            return
+        if source_env not in {"dev", "staging", "prod"}:
+            return
+        if source_env == target_env:
+            return
+        if normalized_mode == "move" and target_env != "prod":
+            return
+        if normalized_mode == "move" and source_env == "prod":
+            return
+
+        action_message = f"Copy {source_env} → {target_env}"
+        if target_env == "dev":
+            action_message = f"Reset dev from {source_env}"
+        elif normalized_mode == "move":
+            action_message = f"Move {source_env} → {target_env}"
+
+        set_env_status(project_id, target_env, "provisioning", "")
+        record_build_event(
+            project_id,
+            target_env,
+            "",
+            "",
+            "promoting",
+            f"{action_message} started ({trigger})",
+        )
+
+        try:
+            with db_session() as db:
+                project = db.query(Project).filter(Project.id == project_id).first()
+                if not project:
+                    return
+                envs = {e.name: e for e in project.envs}
+                if source_env not in envs:
+                    raise RuntimeError(f"Source environment '{source_env}' is missing")
+
+                source_state = (envs[source_env].status or "").strip().lower()
+                if source_state in {"provisioning", "failed"}:
+                    raise RuntimeError(
+                        f"Source environment '{source_env}' is {source_state}. Wait until it is active."
+                    )
+
+                ensure_target_env_exists(db, project, envs, source_env, target_env)
+                promote_env(project, source_env, target_env)
+
+                envs[target_env].status = "active"
+                envs[target_env].last_error = ""
+
+                if normalized_mode == "move":
+                    reset_env(project, source_env)
+                    envs[source_env].status = "active"
+                    envs[source_env].last_error = ""
+                    record_build_event(
+                        project.id,
+                        source_env,
+                        "",
+                        "",
+                        "reset",
+                        f"{source_env} reset after move to {target_env}",
+                    )
+                db.commit()
+
+            set_env_status(project_id, target_env, "active", "")
+            if normalized_mode == "move":
+                set_env_status(project_id, source_env, "active", "")
+
+            final_status = "promoted"
+            if normalized_mode == "move":
+                final_status = "moved"
+            if target_env == "dev":
+                final_status = "reset"
+
+            record_build_event(
+                project_id,
+                target_env,
+                "",
+                "",
+                final_status,
+                action_message,
+            )
+        except Exception as exc:
+            set_env_status(project_id, target_env, "failed", str(exc))
+            record_build_event(
+                project_id,
+                target_env,
+                "",
+                "",
+                "failed",
+                f"{action_message} failed: {str(exc)[:180]}",
+            )
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+
+
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
     user = current_user(request)
@@ -4647,71 +4781,106 @@ def promote_project_env(
             "Promotion order must be dev → staging/prod or staging → prod.",
         )
 
-    try:
-        with db_session() as db:
-            project = get_project_for_user(db, user, project_id)
-            if not project:
-                return HTMLResponse("Not found", status_code=404)
-            locked = ensure_project_mutable(project, f"/projects/{project_id}/settings")
-            if locked:
-                return locked
+    with db_session() as db:
+        project = get_project_for_user(db, user, project_id)
+        if not project:
+            return HTMLResponse("Not found", status_code=404)
+        locked = ensure_project_mutable(project, f"/projects/{project_id}/settings")
+        if locked:
+            return locked
 
-            envs = {e.name: e for e in project.envs}
-            if source_env not in envs:
-                return redirect_with_error(
-                    f"/projects/{project_id}/settings",
-                    f"Source environment '{source_env}' is missing. Create it first.",
-                )
-            source_state = (envs[source_env].status or "").strip().lower()
-            if source_state in {"provisioning", "failed"}:
-                return redirect_with_error(
-                    f"/projects/{project_id}/settings",
-                    f"Source environment '{source_env}' is {source_state}. Wait until it is active before promotion.",
-                    {"env": source_env, "tab": "history"},
-                )
-
-            if target_env not in envs:
-                source_settings = effective_env_settings(project, envs[source_env])
-                temp_env = Environment(
-                    workers=source_settings["workers"],
-                    storage_gb=source_settings["storage_gb"],
-                    odoo_version=source_settings["odoo_version"],
-                )
-                host, db_name = provision_env(project, target_env, temp_env)
-                env_obj = Environment(
-                    project_id=project.id,
-                    name=target_env,
-                    host=host,
-                    db_name=db_name,
-                    workers=source_settings["workers"],
-                    storage_gb=source_settings["storage_gb"],
-                    odoo_version=source_settings["odoo_version"],
-                    status="active",
-                    last_error="",
-                )
-                db.add(env_obj)
-                db.commit()
-                db.refresh(env_obj)
-                envs[target_env] = env_obj
-
-            promote_env(project, source_env, target_env)
-            set_env_status(project.id, target_env, "active", "")
-
-            record_build_event(
-                project.id,
-                target_env,
-                "",
-                "",
-                "promoted",
-                f"Promoted {source_env} → {target_env}",
+        envs = {e.name: e for e in project.envs}
+        if source_env not in envs:
+            return redirect_with_error(
+                f"/projects/{project_id}/settings",
+                f"Source environment '{source_env}' is missing. Create it first.",
             )
-    except Exception as exc:
+        source_state = (envs[source_env].status or "").strip().lower()
+        if source_state in {"provisioning", "failed"}:
+            return redirect_with_error(
+                f"/projects/{project_id}/settings",
+                f"Source environment '{source_env}' is {source_state}. Wait until it is active before promotion.",
+                {"env": source_env, "tab": "history"},
+            )
+
+    mode = "move" if target_env == "prod" and source_env in {"dev", "staging"} else "copy"
+    spawn_env_transfer(project_id, source_env, target_env, mode=mode, trigger="button")
+    notice = f"Promotion started: {source_env} → {target_env}"
+    if mode == "move":
+        notice = f"Move to live started: {source_env} → {target_env} (source will be reset)"
+    return redirect_with_notice(
+        f"/projects/{project_id}/settings",
+        notice,
+        {"env": target_env, "tab": "history"},
+    )
+
+
+@app.post("/projects/{project_id}/branches/transfer")
+def transfer_branch_workspace(
+    request: Request,
+    project_id: int,
+    source_env: str = Form(...),
+    target_env: str = Form(...),
+    mode: str = Form("copy"),
+):
+    user = current_user(request)
+    if not user:
+        return RedirectResponse("/login")
+
+    source_env = (source_env or "").strip().lower()
+    target_env = (target_env or "").strip().lower()
+    mode = (mode or "copy").strip().lower()
+    if source_env not in {"dev", "staging", "prod"} or target_env not in {"dev", "staging", "prod"}:
+        return redirect_with_error(f"/projects/{project_id}/settings", "Invalid environment.")
+    if source_env == target_env:
+        return redirect_with_error(f"/projects/{project_id}/settings", "Source and target are the same.")
+    if mode not in {"copy", "move"}:
+        mode = "copy"
+    if mode == "move" and target_env != "prod":
         return redirect_with_error(
             f"/projects/{project_id}/settings",
-            f"Promotion failed: {str(exc)[:200]}",
+            "Move mode is allowed only when target is prod.",
+        )
+    if mode == "move" and source_env == "prod":
+        return redirect_with_error(
+            f"/projects/{project_id}/settings",
+            "Cannot move from prod.",
         )
 
-    return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
+    with db_session() as db:
+        project = get_project_for_user(db, user, project_id)
+        if not project:
+            return HTMLResponse("Not found", status_code=404)
+        locked = ensure_project_mutable(project, f"/projects/{project_id}/settings")
+        if locked:
+            return locked
+        envs = {e.name: e for e in project.envs}
+        if source_env not in envs:
+            return redirect_with_error(
+                f"/projects/{project_id}/settings",
+                f"Source environment '{source_env}' is missing.",
+                {"env": target_env, "tab": "history"},
+            )
+        source_state = (envs[source_env].status or "").strip().lower()
+        if source_state in {"provisioning", "failed"}:
+            return redirect_with_error(
+                f"/projects/{project_id}/settings",
+                f"Source environment '{source_env}' is {source_state}.",
+                {"env": source_env, "tab": "history"},
+            )
+
+    spawn_env_transfer(project_id, source_env, target_env, mode=mode, trigger="drag-drop")
+    notice = f"Copy started: {source_env} → {target_env}"
+    if target_env == "dev":
+        notice = f"Reset started: dev from {source_env}"
+    elif mode == "move":
+        notice = f"Move to live started: {source_env} → {target_env}"
+
+    return redirect_with_notice(
+        f"/projects/{project_id}/settings",
+        notice,
+        {"env": target_env, "tab": "history"},
+    )
 
 
 @app.post("/projects/{project_id}/reset")
