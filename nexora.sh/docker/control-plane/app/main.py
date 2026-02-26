@@ -53,7 +53,7 @@ ENV_NAMES = ("dev", "staging", "prod")
 ENV_NAME_SET = set(ENV_NAMES)
 ENV_STAGE_ORDER = {"prod": 0, "staging": 1, "dev": 2}
 ENV_STAGE_LABELS = {"prod": "Production", "staging": "Staging", "dev": "Development"}
-WORKSPACE_TAB_SET = {"open", "history", "logs", "backups"}
+WORKSPACE_TAB_SET = {"settings", "history", "logs", "backups"}
 DEFAULT_WORKERS = int(os.getenv("DEFAULT_WORKERS", "1"))
 DEFAULT_STORAGE_GB = int(os.getenv("DEFAULT_STORAGE_GB", "1"))
 DEFAULT_STAGING_SLOTS = int(os.getenv("DEFAULT_STAGING_SLOTS", "1"))
@@ -61,7 +61,7 @@ DEFAULT_ODOO_VERSION = os.getenv("DEFAULT_ODOO_VERSION", "19.0")
 STORAGE_CLASS_NAME = os.getenv("STORAGE_CLASS_NAME", "csi-cinder-high-speed")
 TLS_CLUSTER_ISSUER = os.getenv("TLS_CLUSTER_ISSUER", "letsencrypt-prod").strip()
 APEX_ENV = os.getenv("APEX_ENV", "dev").strip().lower()
-KUBECTL_GET_TIMEOUT = int(os.getenv("KUBECTL_GET_TIMEOUT", "8"))
+KUBECTL_GET_TIMEOUT = int(os.getenv("KUBECTL_GET_TIMEOUT", "20"))
 KUBECTL_MUTATE_TIMEOUT = int(os.getenv("KUBECTL_MUTATE_TIMEOUT", "30"))
 DB_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "8"))
 DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "20000"))
@@ -75,7 +75,7 @@ OVH_QUOTA_CACHE_TTL = max(5, int(os.getenv("OVH_QUOTA_CACHE_TTL", "30")))
 CONTROL_PLANE_RECONCILE_TTL = max(10, int(os.getenv("CONTROL_PLANE_RECONCILE_TTL", "45")))
 MAX_BUILD_EVENTS_PER_PROJECT = max(100, int(os.getenv("MAX_BUILD_EVENTS_PER_PROJECT", "800")))
 BUILD_EVENT_RETENTION_DAYS = max(7, int(os.getenv("BUILD_EVENT_RETENTION_DAYS", "120")))
-INIT_JOB_MAX_WAIT_SECONDS = max(120, int(os.getenv("INIT_JOB_MAX_WAIT_SECONDS", "900")))
+INIT_JOB_MAX_WAIT_SECONDS = max(120, int(os.getenv("INIT_JOB_MAX_WAIT_SECONDS", "1800")))
 INIT_JOB_POLL_SECONDS = max(2, int(os.getenv("INIT_JOB_POLL_SECONDS", "4")))
 INIT_JOB_STALE_SECONDS = max(
     180,
@@ -352,6 +352,7 @@ class Installation(Base):
     installation_id = Column(String, unique=True, nullable=False)
     account_login = Column(String, nullable=False)
     account_id = Column(String, nullable=True)
+    account_type = Column(String, nullable=True)
     installed_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -468,6 +469,14 @@ def ensure_schema():
         ]:
             if name not in env_cols:
                 conn.execute(text(f"ALTER TABLE environments ADD COLUMN {ddl}"))
+
+        inspector = inspect(conn)
+        install_cols = {col["name"] for col in inspector.get_columns("installations")}
+        for name, ddl in [
+            ("account_type", "account_type TEXT"),
+        ]:
+            if name not in install_cols:
+                conn.execute(text(f"ALTER TABLE installations ADD COLUMN {ddl}"))
 
         conn.execute(
             text("UPDATE environments SET workers = :v WHERE workers IS NULL"),
@@ -1220,6 +1229,7 @@ def sync_installations_from_github(force: bool = False, sync_repos: bool = False
                 account = item.get("account") or {}
                 account_login = str((account or {}).get("login") or "").strip()
                 account_id = str((account or {}).get("id") or "").strip()
+                account_type = str((account or {}).get("type") or "").strip()
                 if not installation_id or not account_login:
                     continue
 
@@ -1230,12 +1240,14 @@ def sync_installations_from_github(force: bool = False, sync_repos: bool = False
                 if existing:
                     existing.account_login = account_login
                     existing.account_id = account_id
+                    existing.account_type = account_type
                 else:
                     db.add(
                         Installation(
                             installation_id=installation_id,
                             account_login=account_login,
                             account_id=account_id,
+                            account_type=account_type,
                         )
                     )
                     imported += 1
@@ -1280,31 +1292,65 @@ def github_installation_headers(installation_id: str) -> dict:
     }
 
 
+def github_api_error(resp: httpx.Response, *, max_len: int = 220) -> str:
+    message = ""
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        parts: list[str] = []
+        main = str(payload.get("message") or "").strip()
+        if main:
+            parts.append(main)
+        errors = payload.get("errors")
+        if isinstance(errors, list):
+            snippets: list[str] = []
+            for item in errors[:2]:
+                if isinstance(item, dict):
+                    text = str(item.get("message") or item.get("code") or item.get("field") or "").strip()
+                    if text:
+                        snippets.append(text)
+                elif item:
+                    snippets.append(str(item).strip())
+            if snippets:
+                parts.append(", ".join(snippets))
+        message = " | ".join([part for part in parts if part])
+    if not message:
+        message = (resp.text or "").strip().replace("\n", " ")
+    return message[:max_len] or f"http {resp.status_code}"
+
+
 def github_repo_get(headers: dict, repo_full_name: str) -> tuple[Optional[dict], str]:
     resp = httpx.get(f"https://api.github.com/repos/{repo_full_name}", headers=headers, timeout=20)
     if resp.status_code == 404:
         return None, "not_found"
     if resp.status_code >= 400:
-        msg = (resp.text or "").strip().replace("\n", " ")
-        return None, msg[:220] or f"http {resp.status_code}"
+        return None, github_api_error(resp, max_len=220)
     try:
         return resp.json(), ""
     except Exception:
         return None, "invalid github response"
 
 
-def github_repo_create(headers: dict, account_login: str, repo_name: str) -> dict:
+def github_repo_create(headers: dict, account_login: str, repo_name: str, account_type: str = "") -> dict:
     payload = {"name": repo_name, "private": True, "auto_init": True}
+    account_kind = (account_type or "").strip().lower()
+    org_url = f"https://api.github.com/orgs/{account_login}/repos"
+    user_url = "https://api.github.com/user/repos"
+    if account_kind == "organization":
+        urls = [org_url]
+    elif account_kind == "user":
+        urls = [user_url, org_url]
+    else:
+        urls = [org_url, user_url]
     errors = []
-    for url in [
-        f"https://api.github.com/orgs/{account_login}/repos",
-        "https://api.github.com/user/repos",
-    ]:
+    for url in list(dict.fromkeys(urls)):
         resp = httpx.post(url, headers=headers, json=payload, timeout=20)
         if resp.status_code in {200, 201}:
             return resp.json()
-        msg = (resp.text or "").strip().replace("\n", " ")
-        errors.append(f"{url}: {resp.status_code} {msg[:140]}")
+        msg = github_api_error(resp, max_len=140)
+        errors.append(f"{url}: {resp.status_code} {msg}")
     raise RuntimeError(" ; ".join(errors)[:280] or "repository creation failed")
 
 
@@ -1381,7 +1427,7 @@ def connect_or_create_project_repo(
     if not repo and allow_create and repo_err == "not_found":
         owner = target_full_name.split("/", 1)[0].strip()
         name = target_full_name.split("/", 1)[1].strip()
-        repo = github_repo_create(headers, owner, name)
+        repo = github_repo_create(headers, owner, name, installation.account_type or "")
         created_repo = True
 
     if not repo:
@@ -1479,13 +1525,29 @@ def spawn_repo_bootstrap(project_id: int, user_id: int):
                     f"Repository linked: {project.repo_full_name}{suffix}",
                 )
         except Exception as exc:
+            error_text = str(exc)[:220]
+            lowered = error_text.lower()
+            if (
+                "resource not accessible by integration" in lowered
+                or ("create repository" in lowered and "not found" in lowered)
+                or ("/orgs/" in lowered and "404" in lowered)
+            ):
+                record_build_event(
+                    project_id,
+                    "",
+                    "",
+                    "",
+                    "repo_pending",
+                    "Repository auto-create is not permitted for this installation. Create the repo manually, then connect it in Project Settings.",
+                )
+                return
             record_build_event(
                 project_id,
                 "",
                 "",
                 "",
                 "repo_failed",
-                f"Repository auto-link failed: {str(exc)[:220]}",
+                f"Repository auto-link failed: {error_text}",
             )
 
     thread = threading.Thread(target=_worker, daemon=True)
@@ -1818,6 +1880,7 @@ def spawn_backup_create(project_id: int, env_name: str, *, source: str = "manual
 
             record_build_event(project.id, env_name, "", "", "backup", f"Creating {source} backup")
             replicas = env_replicas(project.slug, env_name)
+            job_name = ""
             try:
                 if replicas > 0:
                     scale_env(project.slug, env_name, 0)
@@ -1833,7 +1896,6 @@ def spawn_backup_create(project_id: int, env_name: str, *, source: str = "manual
                 )
                 kubectl_apply(manifest)
                 wait_for_job_completion(job_name, timeout_seconds=BACKUP_JOB_TIMEOUT_SECONDS)
-                kubectl_delete("job", job_name)
 
                 snapshot.status = "ready"
                 snapshot.note = "Backup available"
@@ -1859,6 +1921,8 @@ def spawn_backup_create(project_id: int, env_name: str, *, source: str = "manual
                     f"Backup failed: {str(exc)[:180]}",
                 )
             finally:
+                if job_name:
+                    kubectl_delete_job_and_pods(job_name)
                 if replicas > 0:
                     try:
                         scale_env(project.slug, env_name, replicas)
@@ -1893,6 +1957,7 @@ def spawn_backup_restore(project_id: int, backup_id: int):
             record_build_event(project.id, env_name, "", "", "restore", f"Restoring backup {backup.id}")
 
             replicas = env_replicas(project.slug, env_name)
+            job_name = ""
             try:
                 if replicas > 0:
                     scale_env(project.slug, env_name, 0)
@@ -1908,7 +1973,6 @@ def spawn_backup_restore(project_id: int, backup_id: int):
                 )
                 kubectl_apply(manifest)
                 wait_for_job_completion(job_name, timeout_seconds=BACKUP_JOB_TIMEOUT_SECONDS)
-                kubectl_delete("job", job_name)
 
                 backup.status = "ready"
                 backup.note = "Backup restored successfully"
@@ -1940,6 +2004,8 @@ def spawn_backup_restore(project_id: int, backup_id: int):
                     f"Restore failed: {str(exc)[:180]}",
                 )
             finally:
+                if job_name:
+                    kubectl_delete_job_and_pods(job_name)
                 if replicas > 0:
                     try:
                         scale_env(project.slug, env_name, replicas)
@@ -2348,7 +2414,7 @@ def kubectl_get_list_json(namespace: str, kind: str, selector: str) -> Optional[
     proc = run_kubectl(
         ["get", kind, "-l", selector, "-o", "json"],
         namespace=namespace,
-        timeout=KUBECTL_GET_TIMEOUT,
+        timeout=max(KUBECTL_GET_TIMEOUT, 12),
     )
     if proc.returncode != 0:
         return None
@@ -2388,9 +2454,18 @@ def k8s_age_seconds(raw: str) -> Optional[int]:
     return max(0, int((datetime.utcnow() - parsed).total_seconds()))
 
 
+def is_kubectl_timeout_error(exc: Exception) -> bool:
+    return "kubectl timed out after" in str(exc).lower()
+
+
 def init_job_failure_reason(slug: str, env: str) -> str:
     job_name = init_job_name(slug, env)
-    pods = kubectl_get_list_json(ODOO_NAMESPACE, "pods", f"job-name={job_name}")
+    try:
+        pods = kubectl_get_list_json(ODOO_NAMESPACE, "pods", f"job-name={job_name}")
+    except Exception as exc:
+        if is_kubectl_timeout_error(exc):
+            return ""
+        raise
     items = (pods or {}).get("items") or []
     if not items:
         return ""
@@ -2422,6 +2497,15 @@ def init_job_failure_reason(slug: str, env: str) -> str:
     if phase and phase not in {"Running", "Succeeded"}:
         return str(phase)[:220]
     return ""
+
+
+def try_init_job_status(slug: str, env: str) -> tuple[Optional[dict], bool]:
+    try:
+        return init_job_status(slug, env), False
+    except Exception as exc:
+        if is_kubectl_timeout_error(exc):
+            return None, True
+        raise
 
 
 def init_job_status(slug: str, env: str) -> Optional[dict]:
@@ -2529,6 +2613,40 @@ def ensure_db_removed(db_name: str, retries: int = 3, retry_delay: float = 1.0):
     raise RuntimeError(f"Failed to prepare clean database '{db_name}': {last_error or 'unknown error'}")
 
 
+def ensure_env_pvc_ready(slug: str, env: str, timeout_seconds: int = 240):
+    pvc_name = f"odoo-filestore-{slug}-{env}"
+    init_job = init_job_name(slug, env)
+    deadline = time.time() + max(30, int(timeout_seconds))
+
+    while time.time() < deadline:
+        pvc = kubectl_get_json(ODOO_NAMESPACE, "pvc", pvc_name)
+        if not pvc:
+            return
+
+        meta = pvc.get("metadata") or {}
+        if not str(meta.get("deletionTimestamp") or "").strip():
+            return
+
+        # Try to release pvc-protection by removing pods that still reference this PVC.
+        for args in [
+            ["delete", "pod", "-l", f"app=odoo,project={slug},env={env}", "--ignore-not-found", "--wait=false"],
+            ["delete", "pod", "-l", f"job-name={init_job}", "--ignore-not-found", "--wait=false"],
+        ]:
+            try:
+                run_kubectl(
+                    args,
+                    namespace=ODOO_NAMESPACE,
+                    timeout=KUBECTL_MUTATE_TIMEOUT,
+                )
+            except Exception:
+                pass
+        time.sleep(3)
+
+    raise RuntimeError(
+        f"PVC '{pvc_name}' is still deleting. Retry after storage cleanup completes."
+    )
+
+
 def purge_project_databases(slug: str):
     safe_slug = (slug or "").strip().lower()
     if not safe_slug or not SLUG_RE.match(safe_slug):
@@ -2619,7 +2737,7 @@ def kubectl_get_json(namespace: str, kind: str, name: str) -> Optional[dict]:
     proc = run_kubectl(
         ["get", kind, name, "-o", "json"],
         namespace=namespace,
-        timeout=KUBECTL_GET_TIMEOUT,
+        timeout=max(KUBECTL_GET_TIMEOUT, 12),
     )
     if proc.returncode != 0:
         return None
@@ -2805,7 +2923,12 @@ def tls_secret_name(slug: str, env_name: str) -> str:
 
 
 def tls_secret_ready(secret_name: str) -> bool:
-    secret = kubectl_get_json(ODOO_NAMESPACE, "secret", secret_name)
+    try:
+        secret = kubectl_get_json(ODOO_NAMESPACE, "secret", secret_name)
+    except Exception as exc:
+        if is_kubectl_timeout_error(exc):
+            return False
+        raise
     if not secret:
         return False
     data = secret.get("data", {})
@@ -2814,7 +2937,12 @@ def tls_secret_ready(secret_name: str) -> bool:
 
 def service_has_ready_endpoints(slug: str, env_name: str) -> Optional[bool]:
     svc_name = f"odoo-{slug}-{env_name}"
-    endpoints = kubectl_get_json(ODOO_NAMESPACE, "endpoints", svc_name)
+    try:
+        endpoints = kubectl_get_json(ODOO_NAMESPACE, "endpoints", svc_name)
+    except Exception as exc:
+        if is_kubectl_timeout_error(exc):
+            return None
+        raise
     if not endpoints:
         # Unknown (RBAC/API hiccup): let other checks decide readiness.
         return None
@@ -2825,7 +2953,12 @@ def service_has_ready_endpoints(slug: str, env_name: str) -> Optional[bool]:
 
 
 def odoo_pod_issue(slug: str, env_name: str) -> str:
-    pods = kubectl_get_list_json(ODOO_NAMESPACE, "pods", f"app=odoo,project={slug},env={env_name}")
+    try:
+        pods = kubectl_get_list_json(ODOO_NAMESPACE, "pods", f"app=odoo,project={slug},env={env_name}")
+    except Exception as exc:
+        if is_kubectl_timeout_error(exc):
+            return ""
+        raise
     if not pods:
         # Unknown (RBAC/API hiccup): do not force a false negative status.
         return ""
@@ -2867,9 +3000,15 @@ def env_runtime_status(project: Project, env_name: str) -> dict:
         env_error = env_obj.last_error
 
     name = f"odoo-{project.slug}-{env_name}"
-    deploy = kubectl_get_json(ODOO_NAMESPACE, "deployment", name)
+    try:
+        deploy = kubectl_get_json(ODOO_NAMESPACE, "deployment", name)
+    except Exception as exc:
+        if is_kubectl_timeout_error(exc):
+            deploy = None
+        else:
+            raise
     if not deploy:
-        job_status = init_job_status(project.slug, env_name)
+        job_status, _ = try_init_job_status(project.slug, env_name)
         if job_status:
             if job_status.get("failed", 0) > 0:
                 reason = (job_status.get("reason") or "").strip()
@@ -2905,7 +3044,7 @@ def env_runtime_status(project: Project, env_name: str) -> dict:
         if endpoints_ready is False:
             return {"ready": False, "message": "Service endpoints not ready"}
 
-        job_status = init_job_status(project.slug, env_name)
+        job_status, _ = try_init_job_status(project.slug, env_name)
         if job_status:
             if job_status.get("failed", 0) > 0:
                 reason = (job_status.get("reason") or "").strip()
@@ -2943,13 +3082,19 @@ def env_runtime_status(project: Project, env_name: str) -> dict:
                 return {"ready": False, "message": f"Deployment blocked: {message[:220]}"}
 
     pvc_name = f"odoo-filestore-{project.slug}-{env_name}"
-    pvc = kubectl_get_json(ODOO_NAMESPACE, "pvc", pvc_name)
+    try:
+        pvc = kubectl_get_json(ODOO_NAMESPACE, "pvc", pvc_name)
+    except Exception as exc:
+        if is_kubectl_timeout_error(exc):
+            pvc = None
+        else:
+            raise
     if pvc:
         phase = pvc.get("status", {}).get("phase")
         if phase == "Pending":
             return {"ready": False, "message": "Storage pending"}
 
-    job_status = init_job_status(project.slug, env_name)
+    job_status, _ = try_init_job_status(project.slug, env_name)
     if job_status:
         if job_status.get("failed", 0) > 0:
             reason = (job_status.get("reason") or "").strip()
@@ -2992,6 +3137,23 @@ def kubectl_wait(kind: str, name: str, timeout: str = "600s"):
         namespace=ODOO_NAMESPACE,
         timeout=max(KUBECTL_MUTATE_TIMEOUT, 90),
     )
+
+
+def kubectl_delete_job_and_pods(job_name: str):
+    if not (job_name or "").strip():
+        return
+    try:
+        kubectl_delete("job", job_name, wait=False)
+    except Exception:
+        pass
+    try:
+        run_kubectl(
+            ["delete", "pod", "-l", f"job-name={job_name}", "--ignore-not-found", "--wait=false"],
+            namespace=ODOO_NAMESPACE,
+            timeout=KUBECTL_MUTATE_TIMEOUT,
+        )
+    except Exception:
+        pass
 
 
 def submit_backup_cleanup_job(*, purge_all: bool, retention_days: int) -> str:
@@ -3125,9 +3287,12 @@ spec:
           persistentVolumeClaim:
             claimName: {dst_pvc}
 """.strip() + "\n"
+    kubectl_delete_job_and_pods(name)
     kubectl_apply(manifest)
-    kubectl_wait("job", name)
-    kubectl_delete("job", name)
+    try:
+        kubectl_wait("job", name)
+    finally:
+        kubectl_delete_job_and_pods(name)
 
 
 def ensure_odoo_init(
@@ -3138,15 +3303,37 @@ def ensure_odoo_init(
 ):
     slug = project.slug
     job_name = init_job_name(slug, env)
-    status = init_job_status(slug, env)
+    status, unknown = try_init_job_status(slug, env)
+    if unknown:
+        # API read timeout; keep current state and retry on next poll cycle.
+        return
     if status:
         if status.get("active", 0) > 0:
-            # Keep runtime deployment scaled down while init job holds the PVC.
-            try:
-                scale_env(slug, env, 0)
-            except Exception:
-                pass
-            return
+            age_seconds = status.get("age_seconds")
+            if (
+                restart_failed
+                and isinstance(age_seconds, int)
+                and age_seconds >= INIT_JOB_STALE_SECONDS
+            ):
+                try:
+                    kubectl_delete("job", job_name)
+                except Exception:
+                    pass
+                try:
+                    run_kubectl(
+                        ["delete", "pod", "-l", f"job-name={job_name}", "--ignore-not-found", "--wait=false"],
+                        namespace=ODOO_NAMESPACE,
+                        timeout=KUBECTL_MUTATE_TIMEOUT,
+                    )
+                except Exception:
+                    pass
+            else:
+                # Keep runtime deployment scaled down while init job holds the PVC.
+                try:
+                    scale_env(slug, env, 0)
+                except Exception:
+                    pass
+                return
         if status.get("succeeded", 0) > 0:
             # Init is done; ensure runtime deployment is allowed to start.
             try:
@@ -3229,7 +3416,10 @@ def wait_for_init_completion(project: Project, env: str, env_obj: Optional[Envir
     ensure_odoo_init(project, env, env_obj, restart_failed=True)
 
     while time.time() < deadline:
-        status = init_job_status(slug, env)
+        status, unknown = try_init_job_status(slug, env)
+        if unknown:
+            time.sleep(INIT_JOB_POLL_SECONDS)
+            continue
         if status:
             if status.get("failed", 0) > 0:
                 reason = (status.get("reason") or "").strip() or "unknown error"
@@ -3240,13 +3430,28 @@ def wait_for_init_completion(project: Project, env: str, env_obj: Optional[Envir
                 except Exception:
                     pass
                 return
+            if (
+                status.get("active", 0) > 0
+                and isinstance(status.get("age_seconds"), int)
+                and int(status.get("age_seconds")) >= INIT_JOB_STALE_SECONDS
+            ):
+                ensure_odoo_init(project, env, env_obj, restart_failed=True)
         else:
             # If job is missing (e.g. manually removed), re-create once.
             ensure_odoo_init(project, env, env_obj, restart_failed=True)
         time.sleep(INIT_JOB_POLL_SECONDS)
 
+    final_status, _ = try_init_job_status(slug, env)
+    final_status = final_status or {}
+    details = []
+    if isinstance(final_status.get("age_seconds"), int):
+        details.append(f"age={int(final_status.get('age_seconds'))}s")
+    active_reason = str(final_status.get("active_reason") or "").strip()
+    if active_reason:
+        details.append(active_reason)
+    suffix = f" ({'; '.join(details)})" if details else ""
     raise RuntimeError(
-        f"Init timeout after {INIT_JOB_MAX_WAIT_SECONDS}s; check pods/logs for odoo-init-{slug}-{env}."
+        f"Init timeout after {INIT_JOB_MAX_WAIT_SECONDS}s{suffix}; check pods/logs for odoo-init-{slug}-{env}."
     )
 
 
@@ -3323,6 +3528,7 @@ def provision_env(project: Project, env: str, env_obj: Optional[Environment] = N
         else ""
     )
 
+    ensure_env_pvc_ready(slug, env)
     create_db(db_name)
 
     manifest = f"""
@@ -3556,6 +3762,7 @@ def delete_env(slug: str, env: str, domain_hosts: Optional[list[str]] = None):
     name = f"odoo-{slug}-{env}"
     pvc_name = f"odoo-filestore-{slug}-{env}"
     cfg_secret = f"odoo-config-{slug}-{env}"
+    init_job = init_job_name(slug, env)
 
     all_domain_hosts = set(domain_hosts or [])
 
@@ -3584,11 +3791,28 @@ def delete_env(slug: str, env: str, domain_hosts: Optional[list[str]] = None):
         ("deployment", name),
         ("secret", cfg_secret),
         ("pvc", pvc_name),
+        ("job", init_job),
     ]:
         try:
             kubectl_delete(kind, resource_name, wait=False)
         except Exception:
             pass
+    try:
+        run_kubectl(
+            ["delete", "pod", "-l", f"app=odoo,project={slug},env={env}", "--ignore-not-found", "--wait=false"],
+            namespace=ODOO_NAMESPACE,
+            timeout=KUBECTL_MUTATE_TIMEOUT,
+        )
+    except Exception:
+        pass
+    try:
+        run_kubectl(
+            ["delete", "pod", "-l", f"job-name={init_job}", "--ignore-not-found", "--wait=false"],
+            namespace=ODOO_NAMESPACE,
+            timeout=KUBECTL_MUTATE_TIMEOUT,
+        )
+    except Exception:
+        pass
 
     try:
         drop_db(db_name_for(slug, env))
@@ -3763,6 +3987,20 @@ def spawn_env_provision(project_id: int, env_name: str):
                     )
                 )
                 db.commit()
+                # Force a fresh init cycle to avoid inheriting stale pending jobs for the same slug/env.
+                job_name = init_job_name(project.slug, env_name)
+                try:
+                    kubectl_delete("job", job_name, wait=False)
+                except Exception:
+                    pass
+                try:
+                    run_kubectl(
+                        ["delete", "pod", "-l", f"job-name={job_name}", "--ignore-not-found", "--wait=false"],
+                        namespace=ODOO_NAMESPACE,
+                        timeout=KUBECTL_MUTATE_TIMEOUT,
+                    )
+                except Exception:
+                    pass
                 # Always start a new provisioning cycle from a clean database name.
                 ensure_db_removed(db_name_for(project.slug, env_name))
 
@@ -4316,6 +4554,7 @@ async def github_webhook(request: Request):
         account = installation.get("account") or payload.get("sender") or {}
         account_login = account.get("login") or ""
         account_id = str(account.get("id") or "")
+        account_type = str(account.get("type") or "")
         if installation_id and account_login:
             with db_session() as db:
                 existing = db.query(Installation).filter(
@@ -4324,12 +4563,14 @@ async def github_webhook(request: Request):
                 if existing:
                     existing.account_login = account_login
                     existing.account_id = account_id
+                    existing.account_type = account_type
                 else:
                     db.add(
                         Installation(
                             installation_id=installation_id,
                             account_login=account_login,
                             account_id=account_id,
+                            account_type=account_type,
                         )
                     )
                 db.commit()
@@ -4626,9 +4867,9 @@ def create_project(
             db.query(ProjectTombstone).filter(ProjectTombstone.slug == slug).first() is not None
         )
 
-    # If this slug existed before, purge stale artifacts/DB names before creating the new project.
+    # Always pre-clean cluster artifacts for this slug so reused names never inherit stale init jobs/PVCs.
+    cleanup_project_slug_artifacts(slug)
     if had_tombstone:
-        cleanup_project_slug_artifacts(slug)
         purge_project_databases(slug)
 
     with db_session() as db:
@@ -4909,13 +5150,13 @@ def project_settings(request: Request, project_id: int):
     error = request.query_params.get("error")
     notice = request.query_params.get("notice")
     selected_env = (request.query_params.get("env") or "").strip().lower()
-    selected_tab = (request.query_params.get("tab") or "open").strip().lower()
+    selected_tab = (request.query_params.get("tab") or "history").strip().lower()
     selected_tab = {
-        "settings": "open",
-        "workspace": "open",
+        "open": "settings",
+        "workspace": "settings",
     }.get(selected_tab, selected_tab)
     if selected_tab not in WORKSPACE_TAB_SET:
-        selected_tab = "open"
+        selected_tab = "history"
     hosting_locations, hosting_location_map, _ = hosting_catalog()
     if github_app_enabled():
         try:
@@ -4970,7 +5211,7 @@ def project_settings(request: Request, project_id: int):
                 continue
             if env.name == "dev":
                 try:
-                    ensure_odoo_init(project, env.name, env)
+                    ensure_odoo_init(project, env.name, env, restart_failed=True)
                 except Exception as exc:
                     env.status = "failed"
                     env.last_error = str(exc)[:500]
@@ -5118,7 +5359,7 @@ def project_env_status(request: Request, project_id: int, env_name: str):
 
         if env_name == "dev":
             try:
-                ensure_odoo_init(project, env_name, env)
+                ensure_odoo_init(project, env_name, env, restart_failed=True)
             except Exception as exc:
                 set_env_status(project.id, env_name, "failed", str(exc))
 
@@ -5167,7 +5408,7 @@ def project_env_open(request: Request, project_id: int, env_name: str):
 
         if env_name == "dev":
             try:
-                ensure_odoo_init(project, env_name, env)
+                ensure_odoo_init(project, env_name, env, restart_failed=True)
             except Exception as exc:
                 set_env_status(project.id, env_name, "failed", str(exc))
 

@@ -352,8 +352,8 @@
       </div>
       <div class="workspace-actions">
         {% if selected_env_obj %}
-          <a class="btn" href="/projects/{{ project.id }}/env/{{ selected_env }}/open">Open</a>
-          <a class="btn ghost" href="#project-settings-form">Project settings</a>
+          <a class="btn" href="/projects/{{ project.id }}/env/{{ selected_env }}/open">Connect</a>
+          <a class="btn ghost" href="#project-settings-form">Settings</a>
           <form method="post" action="/projects/{{ project.id }}/envs/restart" data-confirm="Restart {{ selected_stage_label }} runtime now?" data-long-action="Restarting {{ selected_stage_label }} runtime...">
             <input type="hidden" name="env" value="{{ selected_env }}" />
             <button class="btn ghost {% if selected_env_busy %}disabled{% endif %}" type="submit" {% if selected_env_busy %}disabled{% endif %}>Restart</button>
@@ -440,10 +440,10 @@
     </div>
 
     <div class="workspace-tabs">
-      <a class="btn {% if selected_tab == 'open' %}primary{% else %}ghost{% endif %}" href="/projects/{{ project.id }}/settings?env={{ selected_env }}&tab=open#branch-workspace">Open</a>
+      <a class="btn {% if selected_tab == 'history' %}primary{% else %}ghost{% endif %}" href="/projects/{{ project.id }}/settings?env={{ selected_env }}&tab=history#branch-workspace">History</a>
       <a class="btn {% if selected_tab == 'logs' %}primary{% else %}ghost{% endif %}" href="/projects/{{ project.id }}/settings?env={{ selected_env }}&tab=logs#branch-workspace">Logs</a>
       <a class="btn {% if selected_tab == 'backups' %}primary{% else %}ghost{% endif %}" href="/projects/{{ project.id }}/settings?env={{ selected_env }}&tab=backups#branch-workspace">Backups</a>
-      <a class="btn {% if selected_tab == 'history' %}primary{% else %}ghost{% endif %}" href="/projects/{{ project.id }}/settings?env={{ selected_env }}&tab=history#branch-workspace">History</a>
+      <a class="btn {% if selected_tab == 'settings' %}primary{% else %}ghost{% endif %}" href="/projects/{{ project.id }}/settings?env={{ selected_env }}&tab=settings#branch-workspace">Settings</a>
     </div>
 
     {% if selected_tab == 'history' %}
