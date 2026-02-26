@@ -130,6 +130,7 @@
       <div>
         <div class="muted" style="font-size:12px; margin-bottom:6px;">Repository (owner/name)</div>
         <input class="input" name="repo_full_name" value="{{ project.repo_full_name or '' }}" list="repo-list" />
+        <div class="muted" style="font-size:11px; margin-top:6px;">Leave empty to auto-create and connect <code>{{ project.slug }}</code> in the selected installation.</div>
         <datalist id="repo-list">
           {% for repo in repos %}
             <option value="{{ repo.full_name }}"></option>
@@ -185,6 +186,14 @@
       <div class="row" style="justify-content:flex-end;">
         {% if selected_env_obj %}
           <a class="btn" href="/projects/{{ project.id }}/env/{{ selected_env }}/open">Open</a>
+          <form method="post" action="/projects/{{ project.id }}/envs/restart">
+            <input type="hidden" name="env" value="{{ selected_env }}" />
+            <button class="btn ghost" type="submit">Restart</button>
+          </form>
+          <form method="post" action="/projects/{{ project.id }}/envs/redeploy">
+            <input type="hidden" name="env" value="{{ selected_env }}" />
+            <button class="btn ghost" type="submit">Redeploy</button>
+          </form>
         {% endif %}
 
         {% if selected_env == 'dev' and selected_env_obj %}
@@ -304,7 +313,7 @@
       {% endif %}
     {% elif selected_tab == 'logs' %}
       <div class="card" style="background:#0b1220; border-color:rgba(255,255,255,0.06); box-shadow:none;">
-        <div class="muted" style="font-size:12px; margin-bottom:8px;">Latest runtime logs for {{ selected_env }}.</div>
+        <div class="muted" style="font-size:12px; margin-bottom:8px;">Latest logs for {{ selected_env }} (runtime pod or init job while provisioning).</div>
         <pre style="white-space:pre-wrap; margin:0; font-size:12px; line-height:1.35; max-height:520px; overflow:auto;">{{ branch_logs }}</pre>
       </div>
     {% else %}

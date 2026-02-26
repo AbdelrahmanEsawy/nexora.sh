@@ -57,7 +57,7 @@
 
     <div class="row" style="justify-content: space-between; margin-top:10px;">
       <div id="hosting-summary" class="muted" style="font-size:12px;">Measuring ping to hosting regions...</div>
-      <button class="btn primary" type="submit" style="height:42px;">Create Project</button>
+      <button id="create-project-btn" class="btn primary" type="submit" style="height:42px;">Create Project</button>
     </div>
     <div class="muted" style="font-size:12px; margin-top:8px;">Slug format: 2–31 chars, lowercase letters/numbers, hyphens only.</div>
   </form>
@@ -88,7 +88,7 @@
       <input type="hidden" name="backup_retention_days" value="2" />
       <button class="btn" type="submit">Purge orphans + backups older than 2 days</button>
     </form>
-    <form method="post" action="/admin/maintenance/purge-old">
+    <form method="post" action="/admin/maintenance/purge-old" data-confirm="This will delete ALL backup snapshots. Continue?">
       <input type="hidden" name="backups_mode" value="purge_all" />
       <input type="hidden" name="backup_retention_days" value="2" />
       <button class="btn ghost danger" type="submit">Purge orphans + ALL backups</button>
@@ -123,13 +123,13 @@
       </div>
       <div class="row">
         <a class="btn {% if project.status == 'deleting' %}disabled{% endif %}" href="/projects/{{ project.id }}/settings">Settings</a>
-        <form method="post" action="/projects/{{ project.id }}/delete">
+        <form method="post" action="/projects/{{ project.id }}/delete" data-confirm="Delete project {{ project.display_name or project.slug }}?">
           <button class="btn ghost danger {% if project.status == 'deleting' %}disabled{% endif %}" type="submit" {% if project.status == "deleting" %}disabled{% endif %}>
             {{ "Deleting..." if project.status == "deleting" else "Delete" }}
           </button>
         </form>
         {% if project.status in ["deleting", "delete_failed"] %}
-        <form method="post" action="/projects/{{ project.id }}/delete/force">
+        <form method="post" action="/projects/{{ project.id }}/delete/force" data-confirm="Force clear project {{ project.display_name or project.slug }} from dashboard and cleanup in background?">
           <button class="btn ghost" type="submit">Force clear</button>
         </form>
         {% endif %}
@@ -314,15 +314,51 @@
       }
     }
 
+    const PING_TIMEOUT_MS = 1200;
+    const PING_CACHE_TTL_MS = 5 * 60 * 1000;
+
+    function pingCacheKey(url) {
+      return `nexora:ping:${url}`;
+    }
+
+    function readPingCache(url) {
+      try {
+        const raw = sessionStorage.getItem(pingCacheKey(url));
+        if (!raw) return null;
+        const data = JSON.parse(raw);
+        if (!data || typeof data.value !== 'number' || typeof data.ts !== 'number') return null;
+        if ((Date.now() - data.ts) > PING_CACHE_TTL_MS) return null;
+        return data.value;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function writePingCache(url, value) {
+      if (typeof value !== 'number') return;
+      try {
+        sessionStorage.setItem(
+          pingCacheKey(url),
+          JSON.stringify({ value, ts: Date.now() })
+        );
+      } catch (_) {}
+    }
+
     async function measurePing(url) {
-      const samples = [
-        await probeOnce(url, 2200),
-        await probeOnce(url, 2200),
-        await probeOnce(url, 2200),
-      ].filter((value) => typeof value === 'number');
+      const cached = readPingCache(url);
+      if (typeof cached === 'number') {
+        return cached;
+      }
+      const samples = (await Promise.all([
+        probeOnce(url, PING_TIMEOUT_MS),
+        probeOnce(url, PING_TIMEOUT_MS),
+        probeOnce(url, PING_TIMEOUT_MS),
+      ])).filter((value) => typeof value === 'number');
       if (!samples.length) return null;
-      const sorted = samples.slice().sort((left, right) => left - right);
-      return Math.round(sorted[Math.floor(sorted.length / 2)]);
+      const best = Math.min(...samples);
+      const value = Math.max(1, Math.round(best));
+      writePingCache(url, value);
+      return value;
     }
 
     async function loadCapacity() {
@@ -384,6 +420,19 @@
       const ping = await pingPromiseByUrl[probeUrl];
       pingState[code] = ping;
     })).then(async () => {
+      const measured = Object.entries(pingState).filter(([, value]) => typeof value === 'number');
+      if (measured.length >= 3) {
+        const values = measured.map(([, value]) => value);
+        const minPing = Math.min(...values);
+        const maxPing = Math.max(...values);
+        // If all values are uniformly very high, browser probe is likely noisy; prefer capacity-based auto selection.
+        if (minPing >= 1500 && (maxPing - minPing) <= 500) {
+          measured.forEach(([code]) => {
+            pingState[code] = null;
+          });
+        }
+      }
+
       setProbePayload();
       const capacity = await loadCapacity();
       if (capacity && typeof capacity === 'object') {
@@ -411,6 +460,29 @@
       } else {
         summary.textContent = 'Unable to auto-select a location.';
       }
+    });
+
+    const createForm = document.getElementById('create-project-form');
+    const createBtn = document.getElementById('create-project-btn');
+    if (createForm && createBtn) {
+      createForm.addEventListener('submit', () => {
+        createBtn.disabled = true;
+        createBtn.textContent = 'Creating...';
+      });
+    }
+
+    document.querySelectorAll('form[data-confirm]').forEach((form) => {
+      form.addEventListener('submit', (event) => {
+        const msg = form.getAttribute('data-confirm') || 'Are you sure?';
+        if (!window.confirm(msg)) {
+          event.preventDefault();
+          return;
+        }
+        const submitButton = form.querySelector('button[type="submit"]');
+        if (submitButton) {
+          submitButton.disabled = true;
+        }
+      });
     });
   })();
 </script>

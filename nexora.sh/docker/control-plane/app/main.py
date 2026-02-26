@@ -6,7 +6,7 @@ import re
 import subprocess
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import quote, urlencode
 
@@ -69,6 +69,12 @@ OVH_QUOTA_CACHE_TTL = max(5, int(os.getenv("OVH_QUOTA_CACHE_TTL", "30")))
 CONTROL_PLANE_RECONCILE_TTL = max(10, int(os.getenv("CONTROL_PLANE_RECONCILE_TTL", "45")))
 MAX_BUILD_EVENTS_PER_PROJECT = max(100, int(os.getenv("MAX_BUILD_EVENTS_PER_PROJECT", "800")))
 BUILD_EVENT_RETENTION_DAYS = max(7, int(os.getenv("BUILD_EVENT_RETENTION_DAYS", "120")))
+INIT_JOB_MAX_WAIT_SECONDS = max(120, int(os.getenv("INIT_JOB_MAX_WAIT_SECONDS", "900")))
+INIT_JOB_POLL_SECONDS = max(2, int(os.getenv("INIT_JOB_POLL_SECONDS", "4")))
+INIT_JOB_STALE_SECONDS = max(
+    180,
+    int(os.getenv("INIT_JOB_STALE_SECONDS", str(INIT_JOB_MAX_WAIT_SECONDS))),
+)
 
 DEFAULT_HOSTING_LOCATIONS = [
     {"code": "uk1", "label": "London (UK1)", "region": "Europe", "ovh_region": "UK1"},
@@ -243,6 +249,9 @@ PROJECT_RECONCILE_STATE = {
     "imported_domains": 0,
 }
 PROJECT_RECONCILE_LOCK = threading.Lock()
+GITHUB_INSTALL_SYNC_TTL_SECONDS = max(15, int(os.getenv("GITHUB_INSTALL_SYNC_TTL_SECONDS", "60")))
+GITHUB_INSTALL_SYNC_STATE = {"fetched_at": 0.0}
+GITHUB_INSTALL_SYNC_LOCK = threading.Lock()
 
 
 class User(Base):
@@ -932,6 +941,42 @@ def hosting_catalog(force: bool = False) -> tuple[list[dict], dict, dict]:
     return hosting_locations, hosting_location_map, snapshot
 
 
+def init_job_logs_tail(slug: str, env_name: str, lines: int = 200) -> str:
+    job_name = init_job_name(slug, env_name)
+    pod_lookup = run_kubectl(
+        ["get", "pods", "-l", f"job-name={job_name}", "--sort-by=.metadata.creationTimestamp", "-o", "name"],
+        namespace=ODOO_NAMESPACE,
+        timeout=max(KUBECTL_GET_TIMEOUT, 12),
+    )
+    lookup_err = (pod_lookup.stderr or b"").decode("utf-8", errors="replace").strip()
+    if pod_lookup.returncode != 0:
+        if "forbidden" in lookup_err.lower():
+            return "Init logs permission is missing (RBAC)."
+        return ""
+
+    pod_lines = [
+        line.strip()
+        for line in (pod_lookup.stdout or b"").decode("utf-8", errors="replace").splitlines()
+        if line.strip().startswith("pod/")
+    ]
+    if not pod_lines:
+        return ""
+
+    pod_name = pod_lines[-1].split("/", 1)[1]
+    result = run_kubectl(
+        ["logs", f"pod/{pod_name}", f"--tail={max(20, min(lines, 1000))}"],
+        namespace=ODOO_NAMESPACE,
+        timeout=max(KUBECTL_GET_TIMEOUT, 12),
+    )
+    stdout = (result.stdout or b"").decode("utf-8", errors="replace").strip()
+    stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+    if result.returncode != 0:
+        if "forbidden" in stderr.lower():
+            return "Init logs permission is missing (RBAC)."
+        return ""
+    return stdout
+
+
 def env_logs_tail(slug: str, env_name: str, lines: int = 200) -> str:
     label = f"app=odoo,project={slug},env={env_name}"
     pod_lookup = run_kubectl(
@@ -953,6 +998,12 @@ def env_logs_tail(slug: str, env_name: str, lines: int = 200) -> str:
         if line.strip().startswith("pod/")
     ]
     if not pod_lines:
+        init_logs = init_job_logs_tail(slug, env_name, lines=lines)
+        if init_logs:
+            return (
+                f"No runtime pod yet for {env_name}. Showing init job logs.\n\n"
+                f"{init_logs}"
+            )
         return f"No runtime pod yet for {env_name}. Environment is still provisioning."
     pod_name = pod_lines[-1].split("/", 1)[1]
 
@@ -965,6 +1016,12 @@ def env_logs_tail(slug: str, env_name: str, lines: int = 200) -> str:
     stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
     if result.returncode != 0:
         if "NotFound" in stderr:
+            init_logs = init_job_logs_tail(slug, env_name, lines=lines)
+            if init_logs:
+                return (
+                    f"No runtime pod found for {env_name} yet. Showing init job logs.\n\n"
+                    f"{init_logs}"
+                )
             return f"No runtime pod found for {env_name} yet."
         if "forbidden" in stderr.lower():
             return "Logs permission is missing (RBAC). Apply updated control-plane RBAC and retry."
@@ -1102,6 +1159,311 @@ def sync_installation_repos(installation_id: str):
         db.commit()
 
 
+def sync_installations_from_github(force: bool = False, sync_repos: bool = False) -> int:
+    if not github_app_enabled():
+        return 0
+
+    now = time.time()
+    if not force and (now - float(GITHUB_INSTALL_SYNC_STATE.get("fetched_at") or 0.0)) < GITHUB_INSTALL_SYNC_TTL_SECONDS:
+        return 0
+
+    with GITHUB_INSTALL_SYNC_LOCK:
+        now = time.time()
+        if not force and (now - float(GITHUB_INSTALL_SYNC_STATE.get("fetched_at") or 0.0)) < GITHUB_INSTALL_SYNC_TTL_SECONDS:
+            return 0
+
+        resp = httpx.get(
+            "https://api.github.com/app/installations",
+            headers=github_app_headers(),
+            params={"per_page": 100},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        items = payload if isinstance(payload, list) else []
+
+        imported = 0
+        install_ids: list[str] = []
+        with db_session() as db:
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                installation_id = str(item.get("id") or "").strip()
+                account = item.get("account") or {}
+                account_login = str((account or {}).get("login") or "").strip()
+                account_id = str((account or {}).get("id") or "").strip()
+                if not installation_id or not account_login:
+                    continue
+
+                install_ids.append(installation_id)
+                existing = db.query(Installation).filter(
+                    Installation.installation_id == installation_id
+                ).first()
+                if existing:
+                    existing.account_login = account_login
+                    existing.account_id = account_id
+                else:
+                    db.add(
+                        Installation(
+                            installation_id=installation_id,
+                            account_login=account_login,
+                            account_id=account_id,
+                        )
+                    )
+                    imported += 1
+            db.commit()
+
+        if sync_repos:
+            for installation_id in install_ids:
+                try:
+                    sync_installation_repos(installation_id)
+                except Exception:
+                    pass
+
+        GITHUB_INSTALL_SYNC_STATE["fetched_at"] = time.time()
+        return imported
+
+
+def candidate_installations_for_user(db, user: User) -> list[Installation]:
+    if user.is_admin:
+        return db.query(Installation).order_by(Installation.installed_at.desc()).all()
+
+    scoped = (
+        db.query(Installation)
+        .filter(Installation.account_login == user.username)
+        .order_by(Installation.installed_at.desc())
+        .all()
+    )
+    if scoped:
+        return scoped
+
+    all_installs = db.query(Installation).order_by(Installation.installed_at.desc()).all()
+    if len(all_installs) == 1:
+        return all_installs
+    return []
+
+
+def github_installation_headers(installation_id: str) -> dict:
+    token = github_installation_token(installation_id)
+    return {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def github_repo_get(headers: dict, repo_full_name: str) -> tuple[Optional[dict], str]:
+    resp = httpx.get(f"https://api.github.com/repos/{repo_full_name}", headers=headers, timeout=20)
+    if resp.status_code == 404:
+        return None, "not_found"
+    if resp.status_code >= 400:
+        msg = (resp.text or "").strip().replace("\n", " ")
+        return None, msg[:220] or f"http {resp.status_code}"
+    try:
+        return resp.json(), ""
+    except Exception:
+        return None, "invalid github response"
+
+
+def github_repo_create(headers: dict, account_login: str, repo_name: str) -> dict:
+    payload = {"name": repo_name, "private": True, "auto_init": True}
+    errors = []
+    for url in [
+        f"https://api.github.com/orgs/{account_login}/repos",
+        "https://api.github.com/user/repos",
+    ]:
+        resp = httpx.post(url, headers=headers, json=payload, timeout=20)
+        if resp.status_code in {200, 201}:
+            return resp.json()
+        msg = (resp.text or "").strip().replace("\n", " ")
+        errors.append(f"{url}: {resp.status_code} {msg[:140]}")
+    raise RuntimeError(" ; ".join(errors)[:280] or "repository creation failed")
+
+
+def github_ensure_branches(headers: dict, repo_full_name: str, branches: list[str]) -> list[str]:
+    repo, repo_err = github_repo_get(headers, repo_full_name)
+    if not repo:
+        raise RuntimeError(f"Unable to read repository metadata: {repo_err or 'unknown error'}")
+
+    default_branch = str(repo.get("default_branch") or DEFAULT_PROD_BRANCH or "main").strip() or "main"
+    ref_resp = httpx.get(
+        f"https://api.github.com/repos/{repo_full_name}/git/ref/heads/{quote(default_branch, safe='')}",
+        headers=headers,
+        timeout=20,
+    )
+    if ref_resp.status_code >= 400:
+        msg = (ref_resp.text or "").strip().replace("\n", " ")
+        raise RuntimeError(f"Unable to read default branch ref: {msg[:180] or ref_resp.status_code}")
+    base_sha = (
+        (ref_resp.json().get("object") or {}).get("sha")
+        if isinstance(ref_resp.json(), dict)
+        else ""
+    )
+    if not base_sha:
+        raise RuntimeError("Missing base commit SHA for default branch")
+
+    created: list[str] = []
+    seen = set()
+    for raw_branch in branches:
+        branch = (raw_branch or "").strip()
+        if not branch or branch in seen or branch == default_branch:
+            continue
+        seen.add(branch)
+        existing = httpx.get(
+            f"https://api.github.com/repos/{repo_full_name}/git/ref/heads/{quote(branch, safe='')}",
+            headers=headers,
+            timeout=20,
+        )
+        if existing.status_code == 200:
+            continue
+        if existing.status_code != 404:
+            msg = (existing.text or "").strip().replace("\n", " ")
+            raise RuntimeError(f"Unable to verify branch '{branch}': {msg[:160] or existing.status_code}")
+
+        create_resp = httpx.post(
+            f"https://api.github.com/repos/{repo_full_name}/git/refs",
+            headers=headers,
+            json={"ref": f"refs/heads/{branch}", "sha": base_sha},
+            timeout=20,
+        )
+        if create_resp.status_code in {200, 201, 422}:
+            if create_resp.status_code in {200, 201}:
+                created.append(branch)
+            continue
+        msg = (create_resp.text or "").strip().replace("\n", " ")
+        raise RuntimeError(f"Unable to create branch '{branch}': {msg[:160] or create_resp.status_code}")
+
+    return created
+
+
+def connect_or_create_project_repo(
+    *,
+    project: Project,
+    installation: Installation,
+    repo_full_name: str,
+    allow_create: bool,
+) -> tuple[dict, bool, list[str]]:
+    headers = github_installation_headers(installation.installation_id)
+    target_full_name = repo_full_name.strip()
+    if not target_full_name or "/" not in target_full_name:
+        raise RuntimeError("Invalid repository name")
+
+    repo, repo_err = github_repo_get(headers, target_full_name)
+    created_repo = False
+    if not repo and allow_create and repo_err == "not_found":
+        owner = target_full_name.split("/", 1)[0].strip()
+        name = target_full_name.split("/", 1)[1].strip()
+        repo = github_repo_create(headers, owner, name)
+        created_repo = True
+
+    if not repo:
+        raise RuntimeError(f"Unable to access repository with this installation: {repo_err or 'unknown error'}")
+
+    resolved_full_name = str(repo.get("full_name") or target_full_name).strip()
+    if not resolved_full_name or "/" not in resolved_full_name:
+        raise RuntimeError("GitHub returned an invalid repository name")
+
+    branches_created = github_ensure_branches(
+        headers,
+        resolved_full_name,
+        [
+            project.dev_branch or DEFAULT_DEV_BRANCH,
+            project.staging_branch or DEFAULT_STAGING_BRANCH,
+            project.prod_branch or DEFAULT_PROD_BRANCH,
+        ],
+    )
+    return repo, created_repo, branches_created
+
+
+def spawn_repo_bootstrap(project_id: int, user_id: int):
+    def _worker():
+        if not github_app_enabled():
+            return
+        try:
+            sync_installations_from_github(force=True, sync_repos=True)
+        except Exception:
+            pass
+
+        with db_session() as db:
+            project = db.query(Project).filter(Project.id == project_id).first()
+            user = db.query(User).filter(User.id == user_id).first()
+            if not project or not user:
+                return
+            if project.repo_full_name:
+                return
+            installations = candidate_installations_for_user(db, user)
+            if len(installations) != 1:
+                if not installations:
+                    record_build_event(
+                        project.id,
+                        "",
+                        "",
+                        "",
+                        "repo_pending",
+                        "GitHub repository not linked yet. Install the GitHub App, then connect a repository.",
+                    )
+                else:
+                    record_build_event(
+                        project.id,
+                        "",
+                        "",
+                        "",
+                        "repo_pending",
+                        "Multiple GitHub installations detected. Select the installation in Project Settings and connect.",
+                    )
+                return
+            installation = installations[0]
+            chosen_installation_id = installation.installation_id
+            repo_full_name = f"{installation.account_login}/{project.slug}"
+
+        try:
+            with db_session() as db:
+                project = db.query(Project).filter(Project.id == project_id).first()
+                installation = db.query(Installation).filter(
+                    Installation.installation_id == chosen_installation_id
+                ).first()
+                if not project or not installation or project.repo_full_name:
+                    return
+
+                repo, created_repo, branches_created = connect_or_create_project_repo(
+                    project=project,
+                    installation=installation,
+                    repo_full_name=repo_full_name,
+                    allow_create=True,
+                )
+                project.repo_full_name = str(repo.get("full_name") or repo_full_name)
+                project.repo_id = str(repo.get("id") or "")
+                project.installation_id = installation.installation_id
+                db.commit()
+
+                details = []
+                if created_repo:
+                    details.append("repository created")
+                if branches_created:
+                    details.append(f"branches created: {', '.join(branches_created)}")
+                suffix = f" ({'; '.join(details)})" if details else ""
+                record_build_event(
+                    project.id,
+                    "",
+                    "",
+                    "",
+                    "repo_connected",
+                    f"Repository linked: {project.repo_full_name}{suffix}",
+                )
+        except Exception as exc:
+            record_build_event(
+                project_id,
+                "",
+                "",
+                "",
+                "repo_failed",
+                f"Repository auto-link failed: {str(exc)[:220]}",
+            )
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+
+
 def record_build_event(project_id: int, env: str, branch: str, sha: str, status: str, message: str):
     with db_session() as db:
         db.add(
@@ -1136,6 +1498,151 @@ def branch_from_ref(ref: str) -> str:
     if ref.startswith("refs/heads/"):
         return ref.split("/", 2)[2]
     return ref.split("/")[-1]
+
+
+def env_for_project_branch(project: Project, branch: str) -> str:
+    clean_branch = (branch or "").strip()
+    if not clean_branch:
+        return ""
+    mapping = {
+        (project.dev_branch or DEFAULT_DEV_BRANCH): "dev",
+        (project.staging_branch or DEFAULT_STAGING_BRANCH): "staging",
+        (project.prod_branch or DEFAULT_PROD_BRANCH): "prod",
+    }
+    return mapping.get(clean_branch, "")
+
+
+def queue_env_provision_for_branch(project_id: int, env_name: str) -> str:
+    if env_name not in {"dev", "staging", "prod"}:
+        return "invalid_env"
+    with db_session() as db:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            return "missing_project"
+        env_obj = db.query(Environment).filter(
+            Environment.project_id == project.id,
+            Environment.name == env_name,
+        ).first()
+
+        if env_obj and (env_obj.status or "").strip().lower() == "provisioning":
+            return "already_provisioning"
+        if env_obj and (env_obj.status or "").strip().lower() == "active":
+            return "already_active"
+
+        if not env_obj:
+            db.add(
+                Environment(
+                    project_id=project.id,
+                    name=env_name,
+                    host=host_for(project.slug, env_name),
+                    db_name=db_name_for(project.slug, env_name),
+                    workers=project.workers or DEFAULT_WORKERS,
+                    storage_gb=project.storage_gb or DEFAULT_STORAGE_GB,
+                    odoo_version=project.odoo_version or DEFAULT_ODOO_VERSION,
+                    status="provisioning",
+                    last_error="",
+                )
+            )
+        else:
+            env_obj.status = "provisioning"
+            env_obj.last_error = ""
+        db.commit()
+
+    spawn_env_provision(project_id, env_name)
+    return "queued"
+
+
+def delete_env_for_branch(project_id: int, env_name: str) -> str:
+    if env_name not in {"dev", "staging", "prod"}:
+        return "invalid_env"
+
+    with db_session() as db:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            return "missing_project"
+        env_obj = db.query(Environment).filter(
+            Environment.project_id == project.id,
+            Environment.name == env_name,
+        ).first()
+        if not env_obj:
+            return "missing_env"
+        domain_hosts = [domain.host for domain in list(env_obj.domains)]
+        env_id = env_obj.id
+        project_slug = project.slug
+        env_obj.status = "deleting"
+        env_obj.last_error = ""
+        db.commit()
+
+    try:
+        delete_env(project_slug, env_name, domain_hosts)
+    except Exception as exc:
+        set_env_status(project_id, env_name, "delete_failed", str(exc))
+        return f"delete_failed:{str(exc)[:180]}"
+
+    with db_session() as db:
+        env_obj = db.query(Environment).filter(Environment.id == env_id).first()
+        if env_obj:
+            db.delete(env_obj)
+            db.commit()
+    return "deleted"
+
+
+def promote_on_branch_merge(
+    project_id: int,
+    source_env: str,
+    target_env: str,
+) -> str:
+    if source_env not in {"dev", "staging", "prod"} or target_env not in {"dev", "staging", "prod"}:
+        return "invalid_env"
+    if source_env == target_env:
+        return "same_env"
+
+    try:
+        with db_session() as db:
+            project = db.query(Project).filter(Project.id == project_id).first()
+            if not project:
+                return "missing_project"
+
+            envs = {env.name: env for env in project.envs}
+            if source_env not in envs:
+                return "missing_source"
+            source_state = (envs[source_env].status or "").strip().lower()
+            if source_state in {"provisioning", "failed"}:
+                return f"source_{source_state}"
+
+            if target_env not in envs:
+                source_settings = effective_env_settings(project, envs[source_env])
+                temp_env = Environment(
+                    workers=source_settings["workers"],
+                    storage_gb=source_settings["storage_gb"],
+                    odoo_version=source_settings["odoo_version"],
+                )
+                host, db_name = provision_env(project, target_env, temp_env)
+                db.add(
+                    Environment(
+                        project_id=project.id,
+                        name=target_env,
+                        host=host,
+                        db_name=db_name,
+                        workers=source_settings["workers"],
+                        storage_gb=source_settings["storage_gb"],
+                        odoo_version=source_settings["odoo_version"],
+                        status="active",
+                        last_error="",
+                    )
+                )
+                db.commit()
+
+            promote_env(project, source_env, target_env)
+            set_env_status(project.id, target_env, "active", "")
+        return "promoted"
+    except Exception as exc:
+        return f"promote_failed:{str(exc)[:180]}"
+
+
+def spawn_webhook_task(task):
+    thread = threading.Thread(target=task, daemon=True)
+    thread.start()
 
 
 def run_kubectl(
@@ -1286,6 +1793,26 @@ def kubectl_names_by_selector(namespace: str, kind: str, selector: str) -> list[
     return sorted(set(names))
 
 
+def parse_k8s_timestamp(raw: str) -> Optional[datetime]:
+    value = (raw or "").strip()
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def k8s_age_seconds(raw: str) -> Optional[int]:
+    parsed = parse_k8s_timestamp(raw)
+    if not parsed:
+        return None
+    return max(0, int((datetime.utcnow() - parsed).total_seconds()))
+
+
 def init_job_failure_reason(slug: str, env: str) -> str:
     job_name = init_job_name(slug, env)
     pods = kubectl_get_list_json(ODOO_NAMESPACE, "pods", f"job-name={job_name}")
@@ -1295,7 +1822,7 @@ def init_job_failure_reason(slug: str, env: str) -> str:
 
     pod = sorted(items, key=lambda p: p.get("metadata", {}).get("creationTimestamp", ""))[-1]
     status = pod.get("status", {})
-    for container in status.get("containerStatuses") or []:
+    for container in (status.get("initContainerStatuses") or []) + (status.get("containerStatuses") or []):
         state = container.get("state") or {}
         terminated = state.get("terminated") or {}
         if terminated:
@@ -1307,6 +1834,14 @@ def init_job_failure_reason(slug: str, env: str) -> str:
             reason = waiting.get("reason") or "Waiting"
             message = (waiting.get("message") or "").strip()
             return f"{reason}: {message}"[:220].rstrip(": ")
+        running = state.get("running") or {}
+        if running:
+            started_at = str(running.get("startedAt") or "").strip()
+            if started_at:
+                age = k8s_age_seconds(started_at)
+                if age is not None:
+                    return f"Running for {age}s"
+            return "Running"
 
     phase = status.get("phase")
     if phase and phase not in {"Running", "Succeeded"}:
@@ -1319,20 +1854,33 @@ def init_job_status(slug: str, env: str) -> Optional[dict]:
     if not job:
         return None
     status = job.get("status", {})
+    active = int(status.get("active") or 0)
     failed = int(status.get("failed") or 0)
-    reason = ""
+    failed_reason = ""
+    active_reason = ""
+    started_at = str(
+        status.get("startTime")
+        or (job.get("metadata") or {}).get("creationTimestamp")
+        or ""
+    ).strip()
+    age_seconds = k8s_age_seconds(started_at)
     if failed > 0:
         for cond in status.get("conditions") or []:
             if cond.get("type") == "Failed" and cond.get("status") == "True":
-                reason = (cond.get("message") or cond.get("reason") or "").strip()
+                failed_reason = (cond.get("message") or cond.get("reason") or "").strip()
                 break
-        if not reason:
-            reason = init_job_failure_reason(slug, env)
+        if not failed_reason:
+            failed_reason = init_job_failure_reason(slug, env)
+    if active > 0:
+        active_reason = init_job_failure_reason(slug, env)
     return {
-        "active": int(status.get("active") or 0),
+        "active": active,
         "succeeded": int(status.get("succeeded") or 0),
         "failed": failed,
-        "reason": reason[:220],
+        "reason": failed_reason[:220],
+        "active_reason": active_reason[:220],
+        "started_at": started_at,
+        "age_seconds": age_seconds,
     }
 
 
@@ -1360,6 +1908,17 @@ def create_db(db_name: str):
     conn.close()
 
 
+def db_exists(db_name: str) -> bool:
+    conn = pg_admin_connection()
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (db_name,))
+            return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+
 def drop_db(db_name: str):
     conn = pg_admin_connection()
     conn.autocommit = True
@@ -1373,6 +1932,76 @@ def drop_db(db_name: str):
             pass
         cur.execute(sql.SQL("DROP DATABASE IF EXISTS {};").format(sql.Identifier(db_name)))
     conn.close()
+
+
+def ensure_db_removed(db_name: str, retries: int = 3, retry_delay: float = 1.0):
+    last_error = ""
+    for _ in range(max(1, retries)):
+        try:
+            drop_db(db_name)
+        except Exception as exc:
+            last_error = str(exc)[:220]
+
+        try:
+            if not db_exists(db_name):
+                return
+            last_error = f"database '{db_name}' still exists after drop"
+        except Exception as exc:
+            last_error = str(exc)[:220]
+
+        time.sleep(max(0.2, retry_delay))
+
+    raise RuntimeError(f"Failed to prepare clean database '{db_name}': {last_error or 'unknown error'}")
+
+
+def purge_project_databases(slug: str):
+    safe_slug = (slug or "").strip().lower()
+    if not safe_slug or not SLUG_RE.match(safe_slug):
+        return
+    for env_name in ("dev", "staging", "prod"):
+        db_name = db_name_for(safe_slug, env_name)
+        try:
+            if db_exists(db_name):
+                drop_db(db_name)
+        except Exception:
+            # Best effort purge for stale databases.
+            pass
+
+
+PROJECT_DB_NAME_RE = re.compile(r"^(?P<slug>[a-z0-9-]{2,31})_(?P<env>dev|staging|prod)$")
+
+
+def purge_orphan_project_databases(live_slugs: set[str]) -> int:
+    conn = pg_admin_connection()
+    conn.autocommit = True
+    dropped = 0
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT datname
+                FROM pg_database
+                WHERE datistemplate = false
+                  AND datallowconn = true
+                """
+            )
+            names = [str(row[0]) for row in (cur.fetchall() or []) if row and row[0]]
+    finally:
+        conn.close()
+
+    for db_name in names:
+        match = PROJECT_DB_NAME_RE.match(db_name)
+        if not match:
+            continue
+        slug = match.group("slug")
+        if slug in live_slugs:
+            continue
+        try:
+            drop_db(db_name)
+            dropped += 1
+        except Exception:
+            pass
+    return dropped
 
 
 def clone_db(source: str, dest: str):
@@ -1665,12 +2294,33 @@ def env_runtime_status(project: Project, env_name: str) -> dict:
     name = f"odoo-{project.slug}-{env_name}"
     deploy = kubectl_get_json(ODOO_NAMESPACE, "deployment", name)
     if not deploy:
+        job_status = init_job_status(project.slug, env_name)
+        if job_status:
+            if job_status.get("failed", 0) > 0:
+                reason = (job_status.get("reason") or "").strip()
+                if reason:
+                    return {"ready": False, "message": f"Init failed: {reason}"}
+                return {"ready": False, "message": "Init failed"}
+            if job_status.get("active", 0) > 0:
+                age_seconds = job_status.get("age_seconds")
+                active_reason = (job_status.get("active_reason") or "").strip()
+                if isinstance(age_seconds, int) and age_seconds > INIT_JOB_STALE_SECONDS:
+                    details = f" ({active_reason})" if active_reason else ""
+                    return {
+                        "ready": False,
+                        "message": f"Init failed: timeout after {age_seconds}s{details}",
+                    }
+                if active_reason:
+                    return {"ready": False, "message": f"Initializing database: {active_reason}"}
+                return {"ready": False, "message": "Initializing database"}
         if env_obj and env_obj.status == "provisioning":
             return {"ready": False, "message": "Provisioning resources"}
         if env_obj and env_obj.status == "failed":
             if env_error:
                 return {"ready": False, "message": f"Error: {env_error}"}
             return {"ready": False, "message": "Provisioning failed"}
+        if env_obj and env_obj.status == "active":
+            return {"ready": False, "message": "Runtime deployment missing"}
         return {"ready": False, "message": "Not created yet"}
     status = deploy.get("status", {})
     replicas = int(status.get("replicas") or 0)
@@ -1688,6 +2338,16 @@ def env_runtime_status(project: Project, env_name: str) -> dict:
                     return {"ready": False, "message": f"Init failed: {reason}"}
                 return {"ready": False, "message": "Init failed"}
             if job_status.get("active", 0) > 0:
+                age_seconds = job_status.get("age_seconds")
+                active_reason = (job_status.get("active_reason") or "").strip()
+                if isinstance(age_seconds, int) and age_seconds > INIT_JOB_STALE_SECONDS:
+                    details = f" ({active_reason})" if active_reason else ""
+                    return {
+                        "ready": False,
+                        "message": f"Init failed: timeout after {age_seconds}s{details}",
+                    }
+                if active_reason:
+                    return {"ready": False, "message": f"Initializing database: {active_reason}"}
                 return {"ready": False, "message": "Initializing database"}
         http_code = odoo_http_status(project.slug, env_name)
         if http_code and 200 <= http_code < 400:
@@ -1722,6 +2382,16 @@ def env_runtime_status(project: Project, env_name: str) -> dict:
                 return {"ready": False, "message": f"Init failed: {reason}"}
             return {"ready": False, "message": "Init failed"}
         if job_status.get("active", 0) > 0:
+            age_seconds = job_status.get("age_seconds")
+            active_reason = (job_status.get("active_reason") or "").strip()
+            if isinstance(age_seconds, int) and age_seconds > INIT_JOB_STALE_SECONDS:
+                details = f" ({active_reason})" if active_reason else ""
+                return {
+                    "ready": False,
+                    "message": f"Init failed: timeout after {age_seconds}s{details}",
+                }
+            if active_reason:
+                return {"ready": False, "message": f"Initializing database: {active_reason}"}
             return {"ready": False, "message": "Initializing database"}
 
     pod_issue = odoo_pod_issue(project.slug, env_name)
@@ -1976,6 +2646,35 @@ spec:
     kubectl_apply(manifest)
 
 
+def wait_for_init_completion(project: Project, env: str, env_obj: Optional[Environment] = None):
+    slug = project.slug
+    deadline = time.time() + INIT_JOB_MAX_WAIT_SECONDS
+
+    # Ensure a fresh init job exists (and restart if previous one failed).
+    ensure_odoo_init(project, env, env_obj, restart_failed=True)
+
+    while time.time() < deadline:
+        status = init_job_status(slug, env)
+        if status:
+            if status.get("failed", 0) > 0:
+                reason = (status.get("reason") or "").strip() or "unknown error"
+                raise RuntimeError(f"Init failed: {reason}")
+            if status.get("succeeded", 0) > 0:
+                try:
+                    scale_env(slug, env, 1)
+                except Exception:
+                    pass
+                return
+        else:
+            # If job is missing (e.g. manually removed), re-create once.
+            ensure_odoo_init(project, env, env_obj, restart_failed=True)
+        time.sleep(INIT_JOB_POLL_SECONDS)
+
+    raise RuntimeError(
+        f"Init timeout after {INIT_JOB_MAX_WAIT_SECONDS}s; check pods/logs for odoo-init-{slug}-{env}."
+    )
+
+
 def wipe_filestore(pvc_name: str):
     job = f"wipe-{pvc_name[:45]}".lower()
     run_filestore_job(job, pvc_name, pvc_name, "rm -rf /dst/*")
@@ -2072,6 +2771,8 @@ stringData:
     db_password = {DB_PASSWORD}
     db_name = {db_name}
     workers = {workers}
+    limit_time_cpu = 300
+    limit_time_real = 600
     max_cron_threads = 1
     list_db = False
     proxy_mode = True
@@ -2320,13 +3021,29 @@ def delete_env(slug: str, env: str, domain_hosts: Optional[list[str]] = None):
         pass
 
 
+def has_live_project_for_slug(slug: str) -> bool:
+    safe_slug = (slug or "").strip().lower()
+    if not safe_slug:
+        return False
+    with db_session() as db:
+        project = db.query(Project).filter(Project.slug == safe_slug).first()
+        if not project:
+            return False
+        status = (project.status or "active").strip().lower()
+        return status not in {"deleting", "delete_failed"}
+
+
 def cleanup_project_slug_artifacts(slug: str, env_domains: Optional[dict[str, list[str]]] = None):
     safe_slug = (slug or "").strip().lower()
     if not safe_slug or not SLUG_RE.match(safe_slug):
         return
+    if has_live_project_for_slug(safe_slug):
+        return
 
     domains_by_env = env_domains or {}
     for env_name in ["dev", "staging", "prod"]:
+        if has_live_project_for_slug(safe_slug):
+            return
         try:
             delete_env(safe_slug, env_name, domains_by_env.get(env_name) or [])
         except Exception:
@@ -2342,6 +3059,8 @@ def cleanup_project_slug_artifacts(slug: str, env_domains: Optional[dict[str, li
         ("pvc", "persistentvolumeclaims"),
         ("job", "jobs"),
     ]:
+        if has_live_project_for_slug(safe_slug):
+            return
         names = kubectl_names_by_selector(ODOO_NAMESPACE, plural, selector)
         for name in names:
             try:
@@ -2469,9 +3188,47 @@ def spawn_env_provision(project_id: int, env_name: str):
                     )
                 )
                 db.commit()
+                # Always start a new provisioning cycle from a clean database name.
+                ensure_db_removed(db_name_for(project.slug, env_name))
+
                 host, db_name = provision_env(project, env_name, env_obj)
                 env_obj.host = host
                 env_obj.db_name = db_name
+                env_obj.status = "provisioning"
+                env_obj.last_error = ""
+                db.commit()
+                record_build_event(
+                    project.id,
+                    env_name,
+                    "",
+                    "",
+                    "provisioning",
+                    f"{env_name} resources created. Waiting for database initialization job.",
+                )
+
+            # Wait outside an open DB transaction; init can take minutes.
+            with db_session() as db:
+                project = db.query(Project).filter(Project.id == project_id).first()
+                if not project:
+                    return
+                env_obj = db.query(Environment).filter(
+                    Environment.project_id == project.id,
+                    Environment.name == env_name,
+                ).first()
+                if not env_obj:
+                    return
+                wait_for_init_completion(project, env_name, env_obj)
+
+            with db_session() as db:
+                project = db.query(Project).filter(Project.id == project_id).first()
+                if not project:
+                    return
+                env_obj = db.query(Environment).filter(
+                    Environment.project_id == project.id,
+                    Environment.name == env_name,
+                ).first()
+                if not env_obj:
+                    return
                 env_obj.status = "active"
                 env_obj.last_error = ""
                 db.add(
@@ -2494,6 +3251,127 @@ def spawn_env_provision(project_id: int, env_name: str):
                 "",
                 "failed",
                 f"{env_name} provisioning failed: {str(exc)[:180]}",
+            )
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+
+
+def spawn_env_restart(project_id: int, env_name: str):
+    def _worker():
+        record_build_event(
+            project_id,
+            env_name,
+            "",
+            "",
+            "restarting",
+            f"Restarting {env_name} runtime",
+        )
+        try:
+            with db_session() as db:
+                project = db.query(Project).filter(Project.id == project_id).first()
+                if not project:
+                    return
+                env_obj = db.query(Environment).filter(
+                    Environment.project_id == project.id,
+                    Environment.name == env_name,
+                ).first()
+                if not env_obj:
+                    return
+                restart_env(project.slug, env_name)
+
+            set_env_status(project_id, env_name, "active", "")
+            record_build_event(
+                project_id,
+                env_name,
+                "",
+                "",
+                "active",
+                f"{env_name} runtime restarted",
+            )
+        except Exception as exc:
+            set_env_status(project_id, env_name, "failed", str(exc))
+            record_build_event(
+                project_id,
+                env_name,
+                "",
+                "",
+                "failed",
+                f"{env_name} restart failed: {str(exc)[:180]}",
+            )
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+
+
+def spawn_env_redeploy(project_id: int, env_name: str):
+    def _worker():
+        set_env_status(project_id, env_name, "provisioning", "")
+        record_build_event(
+            project_id,
+            env_name,
+            "",
+            "",
+            "redeploying",
+            f"Redeploying {env_name} environment",
+        )
+        try:
+            with db_session() as db:
+                project = db.query(Project).filter(Project.id == project_id).first()
+                if not project:
+                    return
+                env_obj = db.query(Environment).filter(
+                    Environment.project_id == project.id,
+                    Environment.name == env_name,
+                ).first()
+                if not env_obj:
+                    return
+
+                # Force a fresh init cycle to recover from stale/failed init jobs.
+                job_name = init_job_name(project.slug, env_name)
+                kubectl_delete("job", job_name)
+                run_kubectl(
+                    ["delete", "pod", "-l", f"job-name={job_name}", "--ignore-not-found"],
+                    namespace=ODOO_NAMESPACE,
+                    timeout=KUBECTL_MUTATE_TIMEOUT,
+                )
+
+                host, db_name = provision_env(project, env_name, env_obj)
+                env_obj.host = host
+                env_obj.db_name = db_name
+                env_obj.last_error = ""
+                db.commit()
+
+            with db_session() as db:
+                project = db.query(Project).filter(Project.id == project_id).first()
+                if not project:
+                    return
+                env_obj = db.query(Environment).filter(
+                    Environment.project_id == project.id,
+                    Environment.name == env_name,
+                ).first()
+                if not env_obj:
+                    return
+                wait_for_init_completion(project, env_name, env_obj)
+
+            set_env_status(project_id, env_name, "active", "")
+            record_build_event(
+                project_id,
+                env_name,
+                "",
+                "",
+                "active",
+                f"{env_name} environment redeployed",
+            )
+        except Exception as exc:
+            set_env_status(project_id, env_name, "failed", str(exc))
+            record_build_event(
+                project_id,
+                env_name,
+                "",
+                "",
+                "failed",
+                f"{env_name} redeploy failed: {str(exc)[:180]}",
             )
 
     thread = threading.Thread(target=_worker, daemon=True)
@@ -2711,21 +3589,160 @@ async def github_webhook(request: Request):
             with db_session() as db:
                 project = db.query(Project).filter(Project.repo_full_name == full_name).first()
                 if project:
-                    env = None
-                    if branch == (project.dev_branch or DEFAULT_DEV_BRANCH):
-                        env = "dev"
-                    elif branch == (project.staging_branch or DEFAULT_STAGING_BRANCH):
-                        env = "staging"
-                    elif branch == (project.prod_branch or DEFAULT_PROD_BRANCH):
-                        env = "prod"
+                    env = env_for_project_branch(project, branch)
                     if env:
-                        if env == "dev":
-                            reset_env(project, env)
-                            msg = f"Reset dev on push to {branch}"
+                        try:
+                            if env == "dev":
+                                reset_env(project, env)
+                                msg = f"Reset dev on push to {branch}"
+                            else:
+                                restart_env(project.slug, env)
+                                msg = f"Restarted {env} on push to {branch}"
+                            record_build_event(project.id, env, branch, sha, "deployed", msg)
+                        except Exception as exc:
+                            record_build_event(
+                                project.id,
+                                env,
+                                branch,
+                                sha,
+                                "deploy_failed",
+                                f"Push deploy failed for {env}: {str(exc)[:180]}",
+                            )
+        return {"ok": True}
+
+    if event == "create":
+        repo = payload.get("repository", {})
+        full_name = str(repo.get("full_name") or "").strip()
+        ref_type = str(payload.get("ref_type") or "").strip().lower()
+        branch = str(payload.get("ref") or "").strip()
+        sha = str(payload.get("after") or "")
+
+        if full_name and ref_type == "branch" and branch:
+            with db_session() as db:
+                project = db.query(Project).filter(Project.repo_full_name == full_name).first()
+                project_id = int(project.id) if project else 0
+                env_name = env_for_project_branch(project, branch) if project else ""
+            if project_id and env_name:
+                def _handle_branch_create():
+                    outcome = queue_env_provision_for_branch(project_id, env_name)
+                    if outcome == "queued":
+                        record_build_event(
+                            project_id,
+                            env_name,
+                            branch,
+                            sha,
+                            "branch_created",
+                            f"Branch '{branch}' created. Provisioning {env_name}.",
+                        )
+                    elif outcome in {"already_active", "already_provisioning"}:
+                        record_build_event(
+                            project_id,
+                            env_name,
+                            branch,
+                            sha,
+                            "branch_skipped",
+                            f"Branch '{branch}' created. {env_name} is already {outcome.replace('already_', '')}.",
+                        )
+                    else:
+                        record_build_event(
+                            project_id,
+                            env_name,
+                            branch,
+                            sha,
+                            "branch_failed",
+                            f"Branch '{branch}' create handling failed: {outcome}",
+                        )
+
+                spawn_webhook_task(_handle_branch_create)
+        return {"ok": True}
+
+    if event == "delete":
+        repo = payload.get("repository", {})
+        full_name = str(repo.get("full_name") or "").strip()
+        ref_type = str(payload.get("ref_type") or "").strip().lower()
+        branch = str(payload.get("ref") or "").strip()
+
+        if full_name and ref_type == "branch" and branch:
+            with db_session() as db:
+                project = db.query(Project).filter(Project.repo_full_name == full_name).first()
+                project_id = int(project.id) if project else 0
+                env_name = env_for_project_branch(project, branch) if project else ""
+            if project_id and env_name:
+                def _handle_branch_delete():
+                    outcome = delete_env_for_branch(project_id, env_name)
+                    if outcome == "deleted":
+                        record_build_event(
+                            project_id,
+                            env_name,
+                            branch,
+                            "",
+                            "branch_deleted",
+                            f"Branch '{branch}' deleted. {env_name} environment removed.",
+                        )
+                    elif outcome == "missing_env":
+                        record_build_event(
+                            project_id,
+                            env_name,
+                            branch,
+                            "",
+                            "branch_skipped",
+                            f"Branch '{branch}' deleted. No {env_name} environment was present.",
+                        )
+                    else:
+                        record_build_event(
+                            project_id,
+                            env_name,
+                            branch,
+                            "",
+                            "branch_failed",
+                            f"Branch '{branch}' delete handling failed: {outcome}",
+                        )
+
+                spawn_webhook_task(_handle_branch_delete)
+        return {"ok": True}
+
+    if event == "pull_request":
+        action = str(payload.get("action") or "").strip().lower()
+        pr = payload.get("pull_request") or {}
+        merged = bool(pr.get("merged"))
+        if action == "closed" and merged:
+            base = pr.get("base") or {}
+            head = pr.get("head") or {}
+            base_ref = str(base.get("ref") or "").strip()
+            head_ref = str(head.get("ref") or "").strip()
+            repo = payload.get("repository") or (base.get("repo") or {})
+            full_name = str(repo.get("full_name") or "").strip()
+            merge_sha = str(pr.get("merge_commit_sha") or "")
+
+            if full_name and base_ref and head_ref:
+                with db_session() as db:
+                    project = db.query(Project).filter(Project.repo_full_name == full_name).first()
+                    project_id = int(project.id) if project else 0
+                    source_env = env_for_project_branch(project, head_ref) if project else ""
+                    target_env = env_for_project_branch(project, base_ref) if project else ""
+                if project_id and source_env and target_env and source_env != target_env:
+                    def _handle_merge():
+                        outcome = promote_on_branch_merge(project_id, source_env, target_env)
+                        if outcome == "promoted":
+                            record_build_event(
+                                project_id,
+                                target_env,
+                                base_ref,
+                                merge_sha,
+                                "promoted",
+                                f"Auto-promoted {source_env} → {target_env} after merge {head_ref} → {base_ref}.",
+                            )
                         else:
-                            restart_env(project.slug, env)
-                            msg = f"Restarted {env} on push to {branch}"
-                        record_build_event(project.id, env, branch, sha, "deployed", msg)
+                            record_build_event(
+                                project_id,
+                                target_env,
+                                base_ref,
+                                merge_sha,
+                                "promotion_failed",
+                                f"Auto-promotion on merge {head_ref} → {base_ref} failed: {outcome}",
+                            )
+
+                    spawn_webhook_task(_handle_merge)
         return {"ok": True}
 
     return {"ok": True}
@@ -2833,7 +3850,6 @@ def create_project(
             selected_hosting_ping = probe_results.get(auto_code)
 
     with db_session() as db:
-        remove_project_tombstone(db, slug)
         if db.query(Project).filter(Project.slug == slug).first():
             return redirect_with_error(
                 "/",
@@ -2845,6 +3861,28 @@ def create_project(
                     "hosting_ping_ms": selected_hosting_ping or "",
                 },
             )
+        had_tombstone = (
+            db.query(ProjectTombstone).filter(ProjectTombstone.slug == slug).first() is not None
+        )
+
+    # If this slug existed before, purge stale artifacts/DB names before creating the new project.
+    if had_tombstone:
+        cleanup_project_slug_artifacts(slug)
+        purge_project_databases(slug)
+
+    with db_session() as db:
+        if db.query(Project).filter(Project.slug == slug).first():
+            return redirect_with_error(
+                "/",
+                "Project already exists.",
+                {
+                    "slug": slug,
+                    "display_name": raw_display,
+                    "hosting_location": selected_hosting_location,
+                    "hosting_ping_ms": selected_hosting_ping or "",
+                },
+            )
+        remove_project_tombstone(db, slug)
         project = Project(
             slug=slug,
             display_name=(raw_display or slug).strip()[:80],
@@ -2892,6 +3930,7 @@ def create_project(
         "Project created. Dev provisioning queued.",
     )
     spawn_env_provision(created_project_id, "dev")
+    spawn_repo_bootstrap(created_project_id, user.id)
     if fallback_notice:
         return RedirectResponse(
             f"/projects/{created_project_id}/settings?{urlencode({'notice': fallback_notice})}#env-dev",
@@ -3005,6 +4044,7 @@ def admin_purge_old_artifacts(
         selected_backups_mode = "none"
     safe_retention = max(1, min(3650, int(backup_retention_days or 2)))
 
+    orphan_dbs_dropped = 0
     with db_session() as db:
         live_slugs = {
             (slug or "").strip().lower()
@@ -3025,6 +4065,12 @@ def admin_purge_old_artifacts(
             db.delete(project)
         db.commit()
 
+        live_slugs = {
+            (slug or "").strip().lower()
+            for (slug,) in db.query(Project.slug).all()
+            if slug
+        }
+
         current_project_ids = [pid for (pid,) in db.query(Project.id).all() if pid is not None]
         if current_project_ids:
             db.query(BuildEvent).filter(
@@ -3033,6 +4079,11 @@ def admin_purge_old_artifacts(
         else:
             db.query(BuildEvent).delete(synchronize_session=False)
         db.commit()
+
+    try:
+        orphan_dbs_dropped = purge_orphan_project_databases(live_slugs)
+    except Exception:
+        orphan_dbs_dropped = 0
 
     orphan_slugs = set()
     try:
@@ -3063,7 +4114,7 @@ def admin_purge_old_artifacts(
 
     return redirect_with_notice(
         "/",
-        f"Maintenance cleanup started for {len(cleanup_slugs)} project slug(s), {backup_part}. 404 on deleted subdomains is expected.",
+        f"Maintenance cleanup started for {len(cleanup_slugs)} project slug(s), dropped {orphan_dbs_dropped} orphan database(s), {backup_part}. 404 on deleted subdomains is expected.",
     )
 
 
@@ -3096,6 +4147,11 @@ def project_settings(request: Request, project_id: int):
     if selected_tab not in {"history", "logs", "settings"}:
         selected_tab = "history"
     hosting_locations, hosting_location_map, _ = hosting_catalog()
+    if github_app_enabled():
+        try:
+            sync_installations_from_github(force=False, sync_repos=False)
+        except Exception:
+            pass
     with db_session() as db:
         project = get_project_for_user(db, user, project_id)
         if not project:
@@ -3112,15 +4168,16 @@ def project_settings(request: Request, project_id: int):
             if not selected_env:
                 selected_env = "dev"
 
-        if user.is_admin:
-            installations = db.query(Installation).order_by(Installation.installed_at.desc()).all()
-        else:
-            installations = (
-                db.query(Installation)
-                .filter(Installation.account_login == user.username)
-                .order_by(Installation.installed_at.desc())
-                .all()
-            )
+        installations = candidate_installations_for_user(db, user)
+        if project.installation_id and not any(
+            inst.installation_id == project.installation_id for inst in installations
+        ):
+            pinned = db.query(Installation).filter(
+                Installation.installation_id == project.installation_id
+            ).first()
+            if pinned:
+                installations = [pinned, *installations]
+
         install_ids = [i.installation_id for i in installations]
         repos = []
         if install_ids:
@@ -3268,10 +4325,13 @@ def project_env_status(request: Request, project_id: int, env_name: str):
                 set_env_status(project.id, env_name, "failed", str(exc))
 
         status = env_runtime_status(project, env_name)
+        status_message = (status.get("message") or "").strip()
+        if status_message.lower().startswith("init failed") and (env.status or "").strip().lower() != "failed":
+            set_env_status(project.id, env_name, "failed", status_message)
         return JSONResponse(
             {
                 "ready": bool(status.get("ready")),
-                "message": status.get("message") or "",
+                "message": status_message,
                 "host": env.host,
             }
         )
@@ -3449,49 +4509,80 @@ def connect_repo(
         return RedirectResponse("/login")
 
     repo_full_name = repo_full_name.strip()
-    if not repo_full_name or "/" not in repo_full_name:
-        return HTMLResponse("Invalid repository name", status_code=400)
+    auto_bootstrap = not repo_full_name
+    if github_app_enabled():
+        try:
+            sync_installations_from_github(force=True, sync_repos=False)
+        except Exception:
+            pass
 
     with db_session() as db:
         project = get_project_for_user(db, user, project_id)
         if not project:
-            return HTMLResponse("Not found", status_code=404)
+            return redirect_with_error("/projects", "Project not found.")
         locked = ensure_project_mutable(project, f"/projects/{project_id}/settings")
         if locked:
             return locked
 
         if not installation_id:
-            # Auto-select if exactly one installation matches this user.
-            q = db.query(Installation)
-            if not user.is_admin:
-                q = q.filter(Installation.account_login == user.username)
-            installs = q.all()
+            installs = candidate_installations_for_user(db, user)
             if len(installs) == 1:
                 installation_id = installs[0].installation_id
 
         if not installation_id:
-            return HTMLResponse("Installation ID required", status_code=400)
+            return redirect_with_error(
+                f"/projects/{project_id}/settings",
+                "Installation is required. Install/select GitHub App first.",
+            )
 
-        # Verify access via GitHub App installation token.
+        installation = db.query(Installation).filter(
+            Installation.installation_id == installation_id
+        ).first()
+        if not installation:
+            return redirect_with_error(
+                f"/projects/{project_id}/settings",
+                "Selected installation is not available. Reinstall GitHub App and retry.",
+            )
+
         try:
-            token = github_installation_token(installation_id)
-            headers = {
-                "Authorization": f"token {token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            }
-            resp = httpx.get(f"https://api.github.com/repos/{repo_full_name}", headers=headers, timeout=20)
-            resp.raise_for_status()
-            repo = resp.json()
-        except Exception:
-            return HTMLResponse("Unable to access repository with this installation", status_code=400)
+            target_repo = repo_full_name
+            allow_create = False
+            if auto_bootstrap:
+                target_repo = f"{installation.account_login}/{project.slug}"
+                allow_create = True
+            elif "/" not in target_repo:
+                return redirect_with_error(
+                    f"/projects/{project_id}/settings",
+                    "Repository must be in owner/name format.",
+                )
 
-        project.repo_full_name = repo_full_name
+            repo, created_repo, branches_created = connect_or_create_project_repo(
+                project=project,
+                installation=installation,
+                repo_full_name=target_repo,
+                allow_create=allow_create,
+            )
+        except Exception as exc:
+            return redirect_with_error(
+                f"/projects/{project_id}/settings",
+                f"Repository connect failed: {str(exc)[:220]}",
+            )
+
+        project.repo_full_name = str(repo.get("full_name") or target_repo)
         project.repo_id = str(repo.get("id"))
         project.installation_id = str(installation_id)
         db.commit()
 
-    return RedirectResponse(f"/projects/{project_id}/settings", status_code=302)
+    details = []
+    if auto_bootstrap and created_repo:
+        details.append("created")
+    if branches_created:
+        details.append(f"branches: {', '.join(branches_created)}")
+    detail_msg = f" ({'; '.join(details)})" if details else ""
+    return redirect_with_notice(
+        f"/projects/{project_id}/settings",
+        f"Repository connected: {project.repo_full_name}{detail_msg}",
+    )
 
 
 @app.post("/projects/{project_id}/domains")
@@ -3781,6 +4872,91 @@ def create_env_manual(
 
     spawn_env_provision(project_id, env)
     return RedirectResponse(f"/projects/{project_id}/settings#env-{env}", status_code=303)
+
+
+@app.post("/projects/{project_id}/envs/restart")
+def restart_env_manual(
+    request: Request,
+    project_id: int,
+    env: str = Form(...),
+):
+    user = current_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    if env not in {"dev", "staging", "prod"}:
+        return redirect_with_error(f"/projects/{project_id}/settings", "Invalid environment.")
+
+    with db_session() as db:
+        project = get_project_for_user(db, user, project_id)
+        if not project:
+            return HTMLResponse("Not found", status_code=404)
+        locked = ensure_project_mutable(project, f"/projects/{project_id}/settings")
+        if locked:
+            return locked
+        env_obj = db.query(Environment).filter(
+            Environment.project_id == project.id,
+            Environment.name == env,
+        ).first()
+        if not env_obj:
+            return redirect_with_error(
+                f"/projects/{project_id}/settings",
+                f"{env} environment is not created yet.",
+                {"env": env, "tab": "history"},
+            )
+        env_obj.last_error = ""
+        db.commit()
+
+    spawn_env_restart(project_id, env)
+    return redirect_with_notice(
+        f"/projects/{project_id}/settings",
+        f"{env} restart started.",
+        {"env": env, "tab": "history"},
+    )
+
+
+@app.post("/projects/{project_id}/envs/redeploy")
+def redeploy_env_manual(
+    request: Request,
+    project_id: int,
+    env: str = Form(...),
+):
+    user = current_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    if env not in {"dev", "staging", "prod"}:
+        return redirect_with_error(f"/projects/{project_id}/settings", "Invalid environment.")
+    try:
+        ensure_prereqs()
+    except RuntimeError as exc:
+        return redirect_with_error(f"/projects/{project_id}/settings", str(exc))
+
+    with db_session() as db:
+        project = get_project_for_user(db, user, project_id)
+        if not project:
+            return HTMLResponse("Not found", status_code=404)
+        locked = ensure_project_mutable(project, f"/projects/{project_id}/settings")
+        if locked:
+            return locked
+        env_obj = db.query(Environment).filter(
+            Environment.project_id == project.id,
+            Environment.name == env,
+        ).first()
+        if not env_obj:
+            return redirect_with_error(
+                f"/projects/{project_id}/settings",
+                f"{env} environment is not created yet.",
+                {"env": env, "tab": "history"},
+            )
+        env_obj.status = "provisioning"
+        env_obj.last_error = ""
+        db.commit()
+
+    spawn_env_redeploy(project_id, env)
+    return redirect_with_notice(
+        f"/projects/{project_id}/settings",
+        f"{env} redeploy started.",
+        {"env": env, "tab": "history"},
+    )
 
 
 @app.post("/projects/{project_id}/domains/{domain_id}/delete")

@@ -45,6 +45,10 @@
           }
           if (data.message && data.message.toLowerCase().includes("init failed")) {
             openBtn.textContent = "Blocked: initialization failed";
+          } else if (data.message && data.message.toLowerCase().includes("provisioning failed")) {
+            openBtn.textContent = "Blocked: provisioning failed";
+          } else if (data.message && data.message.toLowerCase().includes("runtime deployment missing")) {
+            openBtn.textContent = "Blocked: runtime deployment missing";
           } else if (data.message && data.message.toLowerCase().includes("tls")) {
             openBtn.textContent = "Waiting for TLS";
           } else {
