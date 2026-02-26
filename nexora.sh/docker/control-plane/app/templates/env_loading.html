@@ -12,6 +12,15 @@
       <div class="muted" style="font-size:12px;">We’ll redirect you once it’s ready.</div>
     </div>
   </div>
+  <div style="margin-top:12px;">
+    <div class="row" style="justify-content:space-between;">
+      <span class="muted" style="font-size:12px;">Progress</span>
+      <span id="progress-percent" class="muted" style="font-size:12px;">0%</span>
+    </div>
+    <div style="height:8px; border-radius:999px; background:rgba(255,255,255,0.12); overflow:hidden; margin-top:6px;">
+      <div id="progress-fill" style="height:100%; width:0%; border-radius:999px; background:linear-gradient(90deg,#22d3ee,#ff7a59); transition:width 0.35s ease;"></div>
+    </div>
+  </div>
   <div class="spacer"></div>
   <div class="row">
     <a class="btn ghost" href="/projects/{{ project.id }}/settings">Back</a>
@@ -23,6 +32,8 @@
   (function () {
     const statusEl = document.getElementById("status-text");
     const openBtn = document.getElementById("open-btn");
+    const progressPercent = document.getElementById("progress-percent");
+    const progressFill = document.getElementById("progress-fill");
     function setOpenReady(host) {
       openBtn.classList.remove("disabled");
       openBtn.removeAttribute("aria-disabled");
@@ -38,6 +49,9 @@
         if (res.ok) {
           const data = await res.json();
           statusEl.textContent = data.message || "Starting";
+          const pct = Math.max(0, Math.min(100, Number(data.progress_percent || 0)));
+          progressPercent.textContent = `${Math.round(pct)}%`;
+          progressFill.style.width = `${pct}%`;
           if (data.ready) {
             setOpenReady(data.host || "{{ env.host }}");
             window.location.href = `https://${data.host || "{{ env.host }}"}`;

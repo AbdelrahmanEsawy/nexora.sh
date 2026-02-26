@@ -60,6 +60,34 @@
     color: var(--muted);
     opacity: 0.9;
   }
+  .progress-wrap {
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 12px;
+    padding: 10px 12px;
+    margin-bottom: 10px;
+    background: rgba(11,18,32,0.65);
+  }
+  .progress-wrap.error {
+    border-color: rgba(248,113,113,0.45);
+    background: rgba(127,29,29,0.2);
+  }
+  .progress-track {
+    width: 100%;
+    height: 8px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.12);
+    overflow: hidden;
+    margin-top: 8px;
+  }
+  .progress-fill {
+    height: 100%;
+    border-radius: 999px;
+    background: linear-gradient(90deg, #22d3ee, #ff7a59);
+    transition: width 0.4s ease;
+  }
+  .progress-wrap.error .progress-fill {
+    background: linear-gradient(90deg, #f87171, #fb7185);
+  }
 </style>
 <div class="card" style="margin-bottom:16px;">
   <div class="row" style="justify-content: space-between;">
@@ -296,6 +324,7 @@
       <div class="row" style="justify-content:flex-end;">
         {% if selected_env_obj %}
           <a class="btn" href="/projects/{{ project.id }}/env/{{ selected_env }}/open">Open</a>
+          <a class="btn ghost" href="#project-settings-form">Project settings</a>
           <form method="post" action="/projects/{{ project.id }}/envs/restart">
             <input type="hidden" name="env" value="{{ selected_env }}" />
             <button class="btn ghost" type="submit">Restart</button>
@@ -351,6 +380,19 @@
       </div>
     </div>
 
+    {% if workspace_progress %}
+      <div id="workspace-progress-wrap" class="progress-wrap {% if workspace_progress.tone == 'error' %}error{% endif %}">
+        <div class="row" style="justify-content:space-between;">
+          <span style="font-size:12px;">Operation progress</span>
+          <span id="workspace-progress-percent" style="font-size:12px;">{{ workspace_progress.percent }}%</span>
+        </div>
+        <div id="workspace-progress-message" class="muted" style="font-size:12px; margin-top:4px;">{{ workspace_progress.message }}</div>
+        <div class="progress-track">
+          <div id="workspace-progress-fill" class="progress-fill" style="width: {{ workspace_progress.percent }}%;"></div>
+        </div>
+      </div>
+    {% endif %}
+
     <div class="muted" style="font-size:12px; margin-bottom:10px;">
       Manage stages from the left panel only. Drag the branch/database line to move/merge between
       <code>Production</code>, <code>Staging</code>, and <code>Development</code>.
@@ -360,7 +402,8 @@
     <div class="row" style="margin-bottom:12px; gap:8px;">
       <a class="btn {% if selected_tab == 'history' %}primary{% else %}ghost{% endif %}" href="/projects/{{ project.id }}/settings?env={{ selected_env }}&tab=history#branch-workspace">History</a>
       <a class="btn {% if selected_tab == 'logs' %}primary{% else %}ghost{% endif %}" href="/projects/{{ project.id }}/settings?env={{ selected_env }}&tab=logs#branch-workspace">Logs</a>
-      <a class="btn {% if selected_tab == 'settings' %}primary{% else %}ghost{% endif %}" href="/projects/{{ project.id }}/settings?env={{ selected_env }}&tab=settings#branch-workspace">Environment settings</a>
+      <a class="btn {% if selected_tab == 'backups' %}primary{% else %}ghost{% endif %}" href="/projects/{{ project.id }}/settings?env={{ selected_env }}&tab=backups#branch-workspace">Backups</a>
+      <a class="btn {% if selected_tab == 'open' %}primary{% else %}ghost{% endif %}" href="/projects/{{ project.id }}/settings?env={{ selected_env }}&tab=open#branch-workspace">Open</a>
     </div>
 
     {% if selected_tab == 'history' %}
@@ -384,6 +427,51 @@
       <div class="card" style="background:#0b1220; border-color:rgba(255,255,255,0.06); box-shadow:none;">
         <div class="muted" style="font-size:12px; margin-bottom:8px;">Latest logs for {{ selected_env }} (runtime pod or init job while provisioning).</div>
         <pre style="white-space:pre-wrap; margin:0; font-size:12px; line-height:1.35; max-height:520px; overflow:auto;">{{ branch_logs }}</pre>
+      </div>
+    {% elif selected_tab == 'backups' %}
+      <div class="card" style="background:#0b1220; border-color:rgba(255,255,255,0.06); box-shadow:none; margin-bottom:10px;">
+        <div class="project-title" style="font-size:16px; margin-bottom:10px;">Daily Backups</div>
+        <div class="muted" style="font-size:12px; margin-bottom:10px;">
+          Automatic daily backups are enabled. You can create, restore, import, and export backups for {{ selected_env }} here.
+        </div>
+        <div class="row" style="margin-bottom:10px;">
+          <form method="post" action="/projects/{{ project.id }}/backups/create">
+            <input type="hidden" name="env" value="{{ selected_env }}" />
+            <button class="btn primary" type="submit">Create backup now</button>
+          </form>
+        </div>
+        <form method="post" action="/projects/{{ project.id }}/backups/import" class="row">
+          <input type="hidden" name="env" value="{{ selected_env }}" />
+          <input class="input" name="object_path" placeholder="snapshots/project/dev/20260226T050000Z.tgz" required />
+          <button class="btn ghost" type="submit">Import backup</button>
+        </form>
+      </div>
+
+      <div class="card" style="background:#0b1220; border-color:rgba(255,255,255,0.06); box-shadow:none;">
+        <div class="project-title" style="font-size:16px; margin-bottom:10px;">Backup History · {{ selected_env }}</div>
+        {% if backup_items %}
+          {% for backup in backup_items %}
+            <div class="card" style="background:#0a1020; margin-bottom:8px; border-color:rgba(255,255,255,0.06); box-shadow:none;">
+              <div class="row" style="justify-content:space-between; margin-bottom:6px;">
+                <div style="font-size:13px; font-weight:600;">#{{ backup.id }} · {{ (backup.source or 'manual')|upper }} · {{ (backup.status or 'unknown')|upper }}</div>
+                <div class="muted" style="font-size:12px;">{{ backup.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</div>
+              </div>
+              <div class="muted" style="font-size:12px; margin-bottom:6px;">{{ backup.object_path or '-' }}</div>
+              {% if backup.note %}<div class="muted" style="font-size:12px; margin-bottom:8px;">{{ backup.note }}</div>{% endif %}
+              <div class="row" style="justify-content:flex-end;">
+                <form method="post" action="/projects/{{ project.id }}/backups/{{ backup.id }}/restore" data-confirm="Restore backup #{{ backup.id }} to {{ selected_env }}?">
+                  <button class="btn ghost" type="submit">Restore</button>
+                </form>
+                <a class="btn ghost" href="/projects/{{ project.id }}/backups/{{ backup.id }}/export">Export</a>
+                <form method="post" action="/projects/{{ project.id }}/backups/{{ backup.id }}/delete" data-confirm="Delete backup #{{ backup.id }} from the list?">
+                  <button class="btn ghost danger" type="submit">Delete</button>
+                </form>
+              </div>
+            </div>
+          {% endfor %}
+        {% else %}
+          <div class="muted" style="font-size:12px;">No backups yet for {{ selected_env }}.</div>
+        {% endif %}
       </div>
     {% else %}
       {% if selected_env_obj %}
@@ -423,6 +511,8 @@
 </div>
 <script>
 (() => {
+  const selectedEnv = "{{ selected_env }}";
+  const hasSelectedEnv = {{ "true" if selected_env_obj else "false" }};
   const slots = Array.from(document.querySelectorAll(".branch-slot"));
   const dndForm = document.getElementById("branch-dnd-form");
   const dndSource = document.getElementById("dnd-source-env");
@@ -559,6 +649,46 @@
         window.alert("Select a source branch different from target.");
       }
     });
+  }
+
+  const progressWrap = document.getElementById("workspace-progress-wrap");
+  const progressPercent = document.getElementById("workspace-progress-percent");
+  const progressMessage = document.getElementById("workspace-progress-message");
+  const progressFill = document.getElementById("workspace-progress-fill");
+  const updateProgress = (percent, message, tone) => {
+    if (!progressWrap || !progressPercent || !progressMessage || !progressFill) {
+      return;
+    }
+    const clamped = Math.max(0, Math.min(100, Number(percent || 0)));
+    progressPercent.textContent = `${Math.round(clamped)}%`;
+    progressMessage.textContent = message || "Starting";
+    progressFill.style.width = `${clamped}%`;
+    if ((tone || "").toLowerCase() === "error") {
+      progressWrap.classList.add("error");
+    } else {
+      progressWrap.classList.remove("error");
+    }
+  };
+
+  const pollProgress = async () => {
+    if (!hasSelectedEnv) {
+      return;
+    }
+    try {
+      const res = await fetch(`/projects/{{ project.id }}/env/${selectedEnv}/status`, {
+        credentials: "same-origin",
+        cache: "no-store",
+      });
+      if (!res.ok) {
+        return;
+      }
+      const data = await res.json();
+      updateProgress(data.progress_percent, data.message, data.progress_tone || "info");
+    } catch (_) {}
+  };
+
+  if (progressWrap && hasSelectedEnv) {
+    window.setInterval(pollProgress, 5000);
   }
 })();
 </script>

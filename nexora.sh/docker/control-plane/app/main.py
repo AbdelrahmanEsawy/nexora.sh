@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import hmac
 import json
@@ -75,6 +76,11 @@ INIT_JOB_STALE_SECONDS = max(
     180,
     int(os.getenv("INIT_JOB_STALE_SECONDS", str(INIT_JOB_MAX_WAIT_SECONDS))),
 )
+BACKUP_JOB_TIMEOUT_SECONDS = max(300, int(os.getenv("BACKUP_JOB_TIMEOUT_SECONDS", "7200")))
+BACKUP_POLL_SECONDS = max(3, int(os.getenv("BACKUP_POLL_SECONDS", "5")))
+BACKUP_SCHEDULER_POLL_SECONDS = max(300, int(os.getenv("BACKUP_SCHEDULER_POLL_SECONDS", "900")))
+DAILY_BACKUP_INTERVAL_SECONDS = max(3600, int(os.getenv("DAILY_BACKUP_INTERVAL_SECONDS", "86400")))
+DAILY_BACKUP_ENABLED = os.getenv("DAILY_BACKUP_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
 
 DEFAULT_HOSTING_LOCATIONS = [
     {"code": "uk1", "label": "London (UK1)", "region": "Europe", "ovh_region": "UK1"},
@@ -252,6 +258,8 @@ PROJECT_RECONCILE_LOCK = threading.Lock()
 GITHUB_INSTALL_SYNC_TTL_SECONDS = max(15, int(os.getenv("GITHUB_INSTALL_SYNC_TTL_SECONDS", "60")))
 GITHUB_INSTALL_SYNC_STATE = {"fetched_at": 0.0}
 GITHUB_INSTALL_SYNC_LOCK = threading.Lock()
+BACKUP_SCHEDULER_STATE = {"started": False}
+BACKUP_SCHEDULER_LOCK = threading.Lock()
 
 
 class User(Base):
@@ -290,6 +298,7 @@ class Project(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     owner = relationship("User", back_populates="projects")
     envs = relationship("Environment", back_populates="project", cascade="all, delete-orphan")
+    backups = relationship("BackupSnapshot", back_populates="project", cascade="all, delete-orphan")
 
 
 class Environment(Base):
@@ -316,6 +325,20 @@ class Domain(Base):
     host = Column(String, unique=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     environment = relationship("Environment", back_populates="domains")
+
+
+class BackupSnapshot(Base):
+    __tablename__ = "backup_snapshots"
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    env = Column(String, nullable=False)
+    source = Column(String, nullable=True)
+    status = Column(String, nullable=True)
+    object_path = Column(String, nullable=True)
+    size_bytes = Column(Integer, nullable=True)
+    note = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    project = relationship("Project", back_populates="backups")
 
 
 class Installation(Base):
@@ -1490,6 +1513,553 @@ def record_build_event(project_id: int, env: str, branch: str, sha: str, status:
                 BuildEvent.id.in_([row[0] for row in overflow if row and row[0]])
             ).delete(synchronize_session=False)
         db.commit()
+
+
+def decode_secret_value(data: dict, key: str) -> str:
+    raw = str((data or {}).get(key) or "").strip()
+    if not raw:
+        return ""
+    try:
+        return base64.b64decode(raw).decode("utf-8").strip()
+    except Exception:
+        return ""
+
+
+def s3_secret_values() -> dict:
+    secret = kubectl_get_json(ODOO_NAMESPACE, "secret", "nexora-s3")
+    if not secret:
+        raise RuntimeError("Missing nexora-s3 secret in odoo-system.")
+    data = (secret.get("data") or {}) if isinstance(secret, dict) else {}
+    values = {
+        "endpoint": decode_secret_value(data, "endpoint"),
+        "bucket": decode_secret_value(data, "bucket"),
+        "region": decode_secret_value(data, "region"),
+        "prefix": decode_secret_value(data, "prefix") or "backups",
+        "access_key_id": decode_secret_value(data, "access_key_id"),
+        "secret_access_key": decode_secret_value(data, "secret_access_key"),
+    }
+    missing = [k for k in ("endpoint", "bucket", "region", "access_key_id", "secret_access_key") if not values.get(k)]
+    if missing:
+        raise RuntimeError(f"Invalid nexora-s3 secret values: missing {', '.join(missing)}")
+    return values
+
+
+def backup_object_path(slug: str, env: str, stamp: Optional[str] = None) -> str:
+    safe_slug = re.sub(r"[^a-z0-9-]", "-", (slug or "").strip().lower())
+    safe_env = (env or "").strip().lower()
+    token = (stamp or datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")).strip()
+    return f"snapshots/{safe_slug}/{safe_env}/{token}.tgz"
+
+
+def backup_job_name(action: str, slug: str, env: str) -> str:
+    token = int(time.time())
+    base = f"nexora-{action}-{slug}-{env}-{token}".lower()
+    base = re.sub(r"[^a-z0-9-]", "-", base).strip("-")
+    if len(base) > 63:
+        base = base[:63].rstrip("-")
+    return base
+
+
+def env_replicas(slug: str, env: str) -> int:
+    deploy = kubectl_get_json(ODOO_NAMESPACE, "deployment", f"odoo-{slug}-{env}")
+    if not deploy:
+        return 0
+    return int(((deploy.get("spec") or {}).get("replicas")) or 0)
+
+
+def job_logs_tail(job_name: str, lines: int = 80) -> str:
+    pod_lookup = run_kubectl(
+        ["get", "pods", "-l", f"job-name={job_name}", "--sort-by=.metadata.creationTimestamp", "-o", "name"],
+        namespace=ODOO_NAMESPACE,
+        timeout=max(KUBECTL_GET_TIMEOUT, 12),
+    )
+    if pod_lookup.returncode != 0:
+        return ""
+    names = [
+        line.strip()
+        for line in (pod_lookup.stdout or b"").decode("utf-8", errors="replace").splitlines()
+        if line.strip().startswith("pod/")
+    ]
+    if not names:
+        return ""
+    pod_name = names[-1].split("/", 1)[1]
+    logs = run_kubectl(
+        ["logs", f"pod/{pod_name}", f"--tail={max(20, min(lines, 400))}"],
+        namespace=ODOO_NAMESPACE,
+        timeout=max(KUBECTL_GET_TIMEOUT, 12),
+    )
+    if logs.returncode != 0:
+        return ""
+    return (logs.stdout or b"").decode("utf-8", errors="replace").strip()
+
+
+def wait_for_job_completion(job_name: str, timeout_seconds: int = BACKUP_JOB_TIMEOUT_SECONDS):
+    deadline = time.time() + max(60, int(timeout_seconds))
+    while time.time() < deadline:
+        job = kubectl_get_json(ODOO_NAMESPACE, "job", job_name)
+        if job:
+            status = job.get("status", {}) or {}
+            if int(status.get("succeeded") or 0) > 0:
+                return
+            if int(status.get("failed") or 0) > 0:
+                reason = ""
+                for cond in status.get("conditions") or []:
+                    if cond.get("type") == "Failed" and cond.get("status") == "True":
+                        reason = (cond.get("message") or cond.get("reason") or "").strip()
+                        break
+                logs = job_logs_tail(job_name, lines=120)
+                details = f" ({reason})" if reason else ""
+                if logs:
+                    details = f"{details}. {logs[:280]}"
+                raise RuntimeError(f"Backup job failed{details}")
+        time.sleep(BACKUP_POLL_SECONDS)
+    raise RuntimeError(f"Backup job timeout after {timeout_seconds}s")
+
+
+def backup_manifest_create(
+    *,
+    job_name: str,
+    slug: str,
+    env: str,
+    db_name: str,
+    object_path: str,
+    s3: dict,
+) -> str:
+    pvc_name = f"odoo-filestore-{slug}-{env}"
+    script = """
+set -eu
+apk add --no-cache python3 py3-pip tar gzip coreutils >/dev/null
+pip3 install --no-cache-dir awscli >/dev/null
+work=/tmp/backup
+mkdir -p "$work"
+PGPASSWORD="$DB_PASSWORD" pg_dump -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -Fc -f "$work/db.dump"
+tar -C /var/lib/odoo -cf "$work/filestore.tar" .
+tar -C "$work" -czf "$work/archive.tgz" db.dump filestore.tar
+root_prefix="${S3_PREFIX:-backups}"
+aws --endpoint-url "$S3_ENDPOINT" \
+  s3 cp "$work/archive.tgz" "s3://${S3_BUCKET}/${root_prefix}/${BACKUP_OBJECT_PATH}" \
+  --region "$S3_REGION" >/dev/null
+echo "Backup uploaded to s3://${S3_BUCKET}/${root_prefix}/${BACKUP_OBJECT_PATH}"
+""".strip()
+    manifest = f"""
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {job_name}
+  namespace: {ODOO_NAMESPACE}
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: backup
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: DB_HOST
+              value: {json.dumps(DB_HOST or "")}
+            - name: DB_PORT
+              value: {json.dumps(DB_PORT or "5432")}
+            - name: DB_USER
+              value: {json.dumps(DB_USER or "")}
+            - name: DB_PASSWORD
+              value: {json.dumps(DB_PASSWORD or "")}
+            - name: DB_NAME
+              value: {json.dumps(db_name)}
+            - name: BACKUP_OBJECT_PATH
+              value: {json.dumps(object_path)}
+            - name: S3_ENDPOINT
+              value: {json.dumps(s3.get("endpoint") or "")}
+            - name: S3_BUCKET
+              value: {json.dumps(s3.get("bucket") or "")}
+            - name: S3_REGION
+              value: {json.dumps(s3.get("region") or "")}
+            - name: S3_PREFIX
+              value: {json.dumps(s3.get("prefix") or "backups")}
+            - name: AWS_ACCESS_KEY_ID
+              value: {json.dumps(s3.get("access_key_id") or "")}
+            - name: AWS_SECRET_ACCESS_KEY
+              value: {json.dumps(s3.get("secret_access_key") or "")}
+          volumeMounts:
+            - name: filestore
+              mountPath: /var/lib/odoo
+          command:
+            - /bin/sh
+            - -c
+            - |
+{chr(10).join("              " + line for line in script.splitlines())}
+      volumes:
+        - name: filestore
+          persistentVolumeClaim:
+            claimName: {pvc_name}
+""".strip() + "\n"
+    return manifest
+
+
+def backup_manifest_restore(
+    *,
+    job_name: str,
+    slug: str,
+    env: str,
+    db_name: str,
+    object_path: str,
+    s3: dict,
+) -> str:
+    pvc_name = f"odoo-filestore-{slug}-{env}"
+    script = """
+set -eu
+apk add --no-cache python3 py3-pip tar gzip coreutils >/dev/null
+pip3 install --no-cache-dir awscli >/dev/null
+work=/tmp/restore
+mkdir -p "$work"
+root_prefix="${S3_PREFIX:-backups}"
+aws --endpoint-url "$S3_ENDPOINT" \
+  s3 cp "s3://${S3_BUCKET}/${root_prefix}/${BACKUP_OBJECT_PATH}" "$work/archive.tgz" \
+  --region "$S3_REGION" >/dev/null
+tar -C "$work" -xzf "$work/archive.tgz"
+PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='${DB_NAME}';" >/dev/null || true
+PGPASSWORD="$DB_PASSWORD" dropdb -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" --if-exists "$DB_NAME"
+PGPASSWORD="$DB_PASSWORD" createdb -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" "$DB_NAME"
+PGPASSWORD="$DB_PASSWORD" pg_restore -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" "$work/db.dump" >/dev/null
+rm -rf /var/lib/odoo/*
+tar -C /var/lib/odoo -xf "$work/filestore.tar"
+chown -R 101:101 /var/lib/odoo >/dev/null 2>&1 || true
+echo "Backup restored from s3://${S3_BUCKET}/${root_prefix}/${BACKUP_OBJECT_PATH}"
+""".strip()
+    manifest = f"""
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {job_name}
+  namespace: {ODOO_NAMESPACE}
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: restore
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: DB_HOST
+              value: {json.dumps(DB_HOST or "")}
+            - name: DB_PORT
+              value: {json.dumps(DB_PORT or "5432")}
+            - name: DB_USER
+              value: {json.dumps(DB_USER or "")}
+            - name: DB_PASSWORD
+              value: {json.dumps(DB_PASSWORD or "")}
+            - name: DB_NAME
+              value: {json.dumps(db_name)}
+            - name: BACKUP_OBJECT_PATH
+              value: {json.dumps(object_path)}
+            - name: S3_ENDPOINT
+              value: {json.dumps(s3.get("endpoint") or "")}
+            - name: S3_BUCKET
+              value: {json.dumps(s3.get("bucket") or "")}
+            - name: S3_REGION
+              value: {json.dumps(s3.get("region") or "")}
+            - name: S3_PREFIX
+              value: {json.dumps(s3.get("prefix") or "backups")}
+            - name: AWS_ACCESS_KEY_ID
+              value: {json.dumps(s3.get("access_key_id") or "")}
+            - name: AWS_SECRET_ACCESS_KEY
+              value: {json.dumps(s3.get("secret_access_key") or "")}
+          volumeMounts:
+            - name: filestore
+              mountPath: /var/lib/odoo
+          command:
+            - /bin/sh
+            - -c
+            - |
+{chr(10).join("              " + line for line in script.splitlines())}
+      volumes:
+        - name: filestore
+          persistentVolumeClaim:
+            claimName: {pvc_name}
+""".strip() + "\n"
+    return manifest
+
+
+def spawn_backup_create(project_id: int, env_name: str, *, source: str = "manual"):
+    def _worker():
+        with db_session() as db:
+            project = db.query(Project).filter(Project.id == project_id).first()
+            if not project:
+                return
+            env_obj = db.query(Environment).filter(
+                Environment.project_id == project.id,
+                Environment.name == env_name,
+            ).first()
+            if not env_obj:
+                return
+
+            token = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            snapshot = BackupSnapshot(
+                project_id=project.id,
+                env=env_name,
+                source=source,
+                status="creating",
+                object_path=backup_object_path(project.slug, env_name, token),
+                note=f"{source} backup started",
+            )
+            db.add(snapshot)
+            db.commit()
+            db.refresh(snapshot)
+
+            record_build_event(project.id, env_name, "", "", "backup", f"Creating {source} backup")
+            replicas = env_replicas(project.slug, env_name)
+            try:
+                if replicas > 0:
+                    scale_env(project.slug, env_name, 0)
+                s3 = s3_secret_values()
+                job_name = backup_job_name("backup", project.slug, env_name)
+                manifest = backup_manifest_create(
+                    job_name=job_name,
+                    slug=project.slug,
+                    env=env_name,
+                    db_name=db_name_for(project.slug, env_name),
+                    object_path=snapshot.object_path or "",
+                    s3=s3,
+                )
+                kubectl_apply(manifest)
+                wait_for_job_completion(job_name, timeout_seconds=BACKUP_JOB_TIMEOUT_SECONDS)
+                kubectl_delete("job", job_name)
+
+                snapshot.status = "ready"
+                snapshot.note = "Backup available"
+                db.commit()
+                record_build_event(
+                    project.id,
+                    env_name,
+                    "",
+                    "",
+                    "backup_ready",
+                    f"Backup created: {snapshot.object_path}",
+                )
+            except Exception as exc:
+                snapshot.status = "failed"
+                snapshot.note = str(exc)[:500]
+                db.commit()
+                record_build_event(
+                    project.id,
+                    env_name,
+                    "",
+                    "",
+                    "backup_failed",
+                    f"Backup failed: {str(exc)[:180]}",
+                )
+            finally:
+                if replicas > 0:
+                    try:
+                        scale_env(project.slug, env_name, replicas)
+                    except Exception:
+                        pass
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+
+
+def spawn_backup_restore(project_id: int, backup_id: int):
+    def _worker():
+        with db_session() as db:
+            backup = db.query(BackupSnapshot).filter(BackupSnapshot.id == backup_id).first()
+            if not backup:
+                return
+            project = db.query(Project).filter(Project.id == project_id).first()
+            if not project or backup.project_id != project.id:
+                return
+            env_name = (backup.env or "").strip().lower()
+            env_obj = db.query(Environment).filter(
+                Environment.project_id == project.id,
+                Environment.name == env_name,
+            ).first()
+            if not env_obj:
+                return
+
+            backup.status = "restoring"
+            backup.note = "Restore in progress"
+            db.commit()
+            set_env_status(project.id, env_name, "provisioning", "")
+            record_build_event(project.id, env_name, "", "", "restore", f"Restoring backup {backup.id}")
+
+            replicas = env_replicas(project.slug, env_name)
+            try:
+                if replicas > 0:
+                    scale_env(project.slug, env_name, 0)
+                s3 = s3_secret_values()
+                job_name = backup_job_name("restore", project.slug, env_name)
+                manifest = backup_manifest_restore(
+                    job_name=job_name,
+                    slug=project.slug,
+                    env=env_name,
+                    db_name=db_name_for(project.slug, env_name),
+                    object_path=backup.object_path or "",
+                    s3=s3,
+                )
+                kubectl_apply(manifest)
+                wait_for_job_completion(job_name, timeout_seconds=BACKUP_JOB_TIMEOUT_SECONDS)
+                kubectl_delete("job", job_name)
+
+                backup.status = "ready"
+                backup.note = "Backup restored successfully"
+                env_obj.status = "active"
+                env_obj.last_error = ""
+                db.commit()
+                set_env_status(project.id, env_name, "active", "")
+                record_build_event(
+                    project.id,
+                    env_name,
+                    "",
+                    "",
+                    "restored",
+                    f"Restored backup {backup.id}",
+                )
+            except Exception as exc:
+                backup.status = "failed"
+                backup.note = f"Restore failed: {str(exc)[:400]}"
+                env_obj.status = "failed"
+                env_obj.last_error = str(exc)[:500]
+                db.commit()
+                set_env_status(project.id, env_name, "failed", str(exc))
+                record_build_event(
+                    project.id,
+                    env_name,
+                    "",
+                    "",
+                    "failed",
+                    f"Restore failed: {str(exc)[:180]}",
+                )
+            finally:
+                if replicas > 0:
+                    try:
+                        scale_env(project.slug, env_name, replicas)
+                    except Exception:
+                        pass
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+
+
+def s3_uri_for_object_path(object_path: str) -> str:
+    s3 = s3_secret_values()
+    prefix = (s3.get("prefix") or "backups").strip("/ ")
+    obj = (object_path or "").strip("/ ")
+    return f"s3://{s3.get('bucket')}/{prefix}/{obj}"
+
+
+def backup_progress_state(
+    env_obj: Optional[Environment],
+    runtime_status: dict,
+    latest_event: Optional[BuildEvent],
+) -> dict:
+    message = str((runtime_status or {}).get("message") or "Starting")
+    ready = bool((runtime_status or {}).get("ready"))
+    event_status = ((latest_event.status if latest_event else "") or "").strip().lower()
+    env_status = ((env_obj.status if env_obj else "") or "").strip().lower()
+    status_key = event_status or env_status
+    percent = 15
+    tone = "info"
+
+    if ready:
+        return {"active": False, "percent": 100, "message": "Ready", "tone": "success"}
+
+    if status_key in {"queued"}:
+        percent = 8
+    elif status_key in {"provisioning", "redeploying", "backup", "backup_ready"}:
+        percent = 30
+    elif status_key in {"promoting", "restore"}:
+        percent = 45
+    elif status_key in {"restarting"}:
+        percent = 70
+    elif status_key in {"moved", "promoted", "restored", "active"}:
+        percent = 90
+    elif status_key in {"failed", "delete_failed", "backup_failed"}:
+        percent = 100
+        tone = "error"
+
+    lower_msg = message.lower()
+    if "initializing database" in lower_msg:
+        percent = max(percent, 55)
+    elif "provisioning" in lower_msg:
+        percent = max(percent, 25)
+    elif "starting" in lower_msg:
+        percent = max(percent, 80)
+    elif lower_msg.startswith("init failed") or "failed" in lower_msg:
+        tone = "error"
+        percent = 100
+
+    active = not ready and tone != "error"
+    return {
+        "active": active,
+        "percent": max(1, min(100, int(percent))),
+        "message": message,
+        "tone": tone,
+    }
+
+
+def run_daily_backup_cycle():
+    now = datetime.utcnow()
+    with db_session() as db:
+        projects = db.query(Project).filter(~Project.status.in_(["deleting", "delete_failed"])).all()
+        for project in projects:
+            for env in list(project.envs):
+                env_name = (env.name or "").strip().lower()
+                if env_name not in {"dev", "staging", "prod"}:
+                    continue
+                state = (env.status or "").strip().lower()
+                if state in {"provisioning", "failed", "deleting"}:
+                    continue
+                pending = (
+                    db.query(BackupSnapshot)
+                    .filter(
+                        BackupSnapshot.project_id == project.id,
+                        BackupSnapshot.env == env_name,
+                        BackupSnapshot.status.in_(["creating", "restoring"]),
+                    )
+                    .order_by(BackupSnapshot.created_at.desc())
+                    .first()
+                )
+                if pending and (now - pending.created_at).total_seconds() < BACKUP_JOB_TIMEOUT_SECONDS:
+                    continue
+                last_daily = (
+                    db.query(BackupSnapshot)
+                    .filter(
+                        BackupSnapshot.project_id == project.id,
+                        BackupSnapshot.env == env_name,
+                        BackupSnapshot.source == "daily",
+                        BackupSnapshot.status == "ready",
+                    )
+                    .order_by(BackupSnapshot.created_at.desc())
+                    .first()
+                )
+                if last_daily and (now - last_daily.created_at).total_seconds() < DAILY_BACKUP_INTERVAL_SECONDS:
+                    continue
+                spawn_backup_create(project.id, env_name, source="daily")
+
+
+def ensure_backup_scheduler():
+    if not DAILY_BACKUP_ENABLED:
+        return
+    with BACKUP_SCHEDULER_LOCK:
+        if BACKUP_SCHEDULER_STATE.get("started"):
+            return
+
+        def _worker():
+            while True:
+                try:
+                    run_daily_backup_cycle()
+                except Exception:
+                    pass
+                time.sleep(BACKUP_SCHEDULER_POLL_SECONDS)
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+        BACKUP_SCHEDULER_STATE["started"] = True
 
 
 def branch_from_ref(ref: str) -> str:
@@ -3517,6 +4087,7 @@ def index(request: Request):
     user = current_user(request)
     if not user:
         return RedirectResponse("/login")
+    ensure_backup_scheduler()
     maybe_reconcile_cluster_projects(user)
 
     error = request.query_params.get("error")
@@ -4272,13 +4843,16 @@ def project_settings(request: Request, project_id: int):
     user = current_user(request)
     if not user:
         return RedirectResponse("/login")
+    ensure_backup_scheduler()
     if user.is_admin:
         maybe_reconcile_cluster_projects(user)
     error = request.query_params.get("error")
     notice = request.query_params.get("notice")
     selected_env = (request.query_params.get("env") or "").strip().lower()
     selected_tab = (request.query_params.get("tab") or "history").strip().lower()
-    if selected_tab not in {"history", "logs", "settings"}:
+    if selected_tab == "settings":
+        selected_tab = "open"
+    if selected_tab not in {"history", "logs", "backups", "open"}:
         selected_tab = "history"
     hosting_locations, hosting_location_map, _ = hosting_catalog()
     if github_app_enabled():
@@ -4388,6 +4962,24 @@ def project_settings(request: Request, project_id: int):
                     if (build.env or "").strip() in {"", selected_env}
                 ]
         branch_logs = ""
+        backup_items = (
+            db.query(BackupSnapshot)
+            .filter(BackupSnapshot.project_id == project.id, BackupSnapshot.env == selected_env)
+            .order_by(BackupSnapshot.created_at.desc(), BackupSnapshot.id.desc())
+            .limit(60)
+            .all()
+        )
+        latest_env_event = (
+            db.query(BuildEvent)
+            .filter(BuildEvent.project_id == project.id, BuildEvent.env == selected_env)
+            .order_by(BuildEvent.created_at.desc(), BuildEvent.id.desc())
+            .first()
+        )
+        workspace_progress = backup_progress_state(
+            selected_env_obj,
+            env_status.get(selected_env) or {},
+            latest_env_event,
+        )
         if selected_tab == "logs":
             if selected_env_obj:
                 branch_logs = env_logs_tail(project.slug, selected_env, lines=260)
@@ -4422,6 +5014,8 @@ def project_settings(request: Request, project_id: int):
                 "selected_tab": selected_tab,
                 "selected_env_obj": selected_env_obj,
                 "branch_logs": branch_logs,
+                "backup_items": backup_items,
+                "workspace_progress": workspace_progress,
                 "github_install_url": github_install_url(),
                 "error": error,
                 "notice": notice,
@@ -4462,11 +5056,21 @@ def project_env_status(request: Request, project_id: int, env_name: str):
         status_message = (status.get("message") or "").strip()
         if status_message.lower().startswith("init failed") and (env.status or "").strip().lower() != "failed":
             set_env_status(project.id, env_name, "failed", status_message)
+        latest_event = (
+            db.query(BuildEvent)
+            .filter(BuildEvent.project_id == project.id, BuildEvent.env == env_name)
+            .order_by(BuildEvent.created_at.desc(), BuildEvent.id.desc())
+            .first()
+        )
+        progress = backup_progress_state(env, status, latest_event)
         return JSONResponse(
             {
                 "ready": bool(status.get("ready")),
                 "message": status_message,
                 "host": env.host,
+                "progress_percent": progress.get("percent", 0),
+                "progress_active": progress.get("active", False),
+                "progress_tone": progress.get("tone", "info"),
             }
         )
 
@@ -4880,6 +5484,267 @@ def transfer_branch_workspace(
         f"/projects/{project_id}/settings",
         notice,
         {"env": target_env, "tab": "history"},
+    )
+
+
+@app.post("/projects/{project_id}/backups/create")
+def create_backup_manual(
+    request: Request,
+    project_id: int,
+    env: str = Form(...),
+    source: str = Form("manual"),
+):
+    user = current_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    env = (env or "").strip().lower()
+    source = (source or "manual").strip().lower()
+    if source not in {"manual", "daily"}:
+        source = "manual"
+    if env not in {"dev", "staging", "prod"}:
+        return redirect_with_error(f"/projects/{project_id}/settings", "Invalid environment.")
+
+    with db_session() as db:
+        project = get_project_for_user(db, user, project_id)
+        if not project:
+            return HTMLResponse("Not found", status_code=404)
+        locked = ensure_project_mutable(project, f"/projects/{project_id}/settings")
+        if locked:
+            return locked
+        env_obj = db.query(Environment).filter(
+            Environment.project_id == project.id,
+            Environment.name == env,
+        ).first()
+        if not env_obj:
+            return redirect_with_error(
+                f"/projects/{project_id}/settings",
+                f"{env} environment is not created yet.",
+                {"env": env, "tab": "backups"},
+            )
+        pending = (
+            db.query(BackupSnapshot)
+            .filter(
+                BackupSnapshot.project_id == project.id,
+                BackupSnapshot.env == env,
+                BackupSnapshot.status.in_(["creating", "restoring"]),
+            )
+            .order_by(BackupSnapshot.created_at.desc())
+            .first()
+        )
+        if pending and (datetime.utcnow() - pending.created_at).total_seconds() < BACKUP_JOB_TIMEOUT_SECONDS:
+            return redirect_with_notice(
+                f"/projects/{project_id}/settings",
+                "A backup operation is already running for this environment.",
+                {"env": env, "tab": "backups"},
+            )
+
+    spawn_backup_create(project_id, env, source=source)
+    return redirect_with_notice(
+        f"/projects/{project_id}/settings",
+        f"Backup started for {env} ({source}).",
+        {"env": env, "tab": "backups"},
+    )
+
+
+@app.post("/projects/{project_id}/backups/import")
+def import_backup_reference(
+    request: Request,
+    project_id: int,
+    env: str = Form(...),
+    object_path: str = Form(...),
+):
+    user = current_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    env = (env or "").strip().lower()
+    object_path = (object_path or "").strip().strip("/")
+    if env not in {"dev", "staging", "prod"}:
+        return redirect_with_error(f"/projects/{project_id}/settings", "Invalid environment.")
+    if not object_path:
+        return redirect_with_error(
+            f"/projects/{project_id}/settings",
+            "Backup object path is required.",
+            {"env": env, "tab": "backups"},
+        )
+
+    with db_session() as db:
+        project = get_project_for_user(db, user, project_id)
+        if not project:
+            return HTMLResponse("Not found", status_code=404)
+        locked = ensure_project_mutable(project, f"/projects/{project_id}/settings")
+        if locked:
+            return locked
+        env_obj = db.query(Environment).filter(
+            Environment.project_id == project.id,
+            Environment.name == env,
+        ).first()
+        if not env_obj:
+            return redirect_with_error(
+                f"/projects/{project_id}/settings",
+                f"{env} environment is not created yet.",
+                {"env": env, "tab": "backups"},
+            )
+        db.add(
+            BackupSnapshot(
+                project_id=project.id,
+                env=env,
+                source="import",
+                status="ready",
+                object_path=object_path,
+                note="Imported backup reference",
+            )
+        )
+        db.commit()
+
+    return redirect_with_notice(
+        f"/projects/{project_id}/settings",
+        "Backup imported successfully.",
+        {"env": env, "tab": "backups"},
+    )
+
+
+@app.post("/projects/{project_id}/backups/{backup_id}/restore")
+def restore_backup_manual(
+    request: Request,
+    project_id: int,
+    backup_id: int,
+):
+    user = current_user(request)
+    if not user:
+        return RedirectResponse("/login")
+
+    with db_session() as db:
+        project = get_project_for_user(db, user, project_id)
+        if not project:
+            return HTMLResponse("Not found", status_code=404)
+        locked = ensure_project_mutable(project, f"/projects/{project_id}/settings")
+        if locked:
+            return locked
+        backup = db.query(BackupSnapshot).filter(BackupSnapshot.id == backup_id).first()
+        if not backup or backup.project_id != project.id:
+            return redirect_with_error(
+                f"/projects/{project_id}/settings",
+                "Backup not found.",
+            )
+        env_name = (backup.env or "").strip().lower()
+        if env_name not in {"dev", "staging", "prod"}:
+            return redirect_with_error(
+                f"/projects/{project_id}/settings",
+                "Backup environment is invalid.",
+            )
+        pending = (
+            db.query(BackupSnapshot)
+            .filter(
+                BackupSnapshot.project_id == project.id,
+                BackupSnapshot.env == env_name,
+                BackupSnapshot.status.in_(["creating", "restoring"]),
+            )
+            .order_by(BackupSnapshot.created_at.desc())
+            .first()
+        )
+        if pending and pending.id != backup.id and (datetime.utcnow() - pending.created_at).total_seconds() < BACKUP_JOB_TIMEOUT_SECONDS:
+            return redirect_with_notice(
+                f"/projects/{project_id}/settings",
+                f"Another backup operation is running on {env_name}.",
+                {"env": env_name, "tab": "backups"},
+            )
+
+    spawn_backup_restore(project_id, backup_id)
+    return redirect_with_notice(
+        f"/projects/{project_id}/settings",
+        f"Restore started from backup #{backup_id}.",
+        {"env": env_name, "tab": "backups"},
+    )
+
+
+@app.post("/projects/{project_id}/backups/{backup_id}/delete")
+def delete_backup_reference(
+    request: Request,
+    project_id: int,
+    backup_id: int,
+):
+    user = current_user(request)
+    if not user:
+        return RedirectResponse("/login")
+
+    with db_session() as db:
+        project = get_project_for_user(db, user, project_id)
+        if not project:
+            return HTMLResponse("Not found", status_code=404)
+        locked = ensure_project_mutable(project, f"/projects/{project_id}/settings")
+        if locked:
+            return locked
+        backup = db.query(BackupSnapshot).filter(BackupSnapshot.id == backup_id).first()
+        if not backup or backup.project_id != project.id:
+            return redirect_with_error(
+                f"/projects/{project_id}/settings",
+                "Backup not found.",
+            )
+        env_name = (backup.env or "dev").strip().lower()
+        if (backup.status or "").strip().lower() in {"creating", "restoring"}:
+            return redirect_with_notice(
+                f"/projects/{project_id}/settings",
+                "Backup operation is still running and cannot be removed now.",
+                {"env": env_name, "tab": "backups"},
+            )
+        db.delete(backup)
+        db.commit()
+        record_build_event(
+            project.id,
+            env_name,
+            "",
+            "",
+            "backup_deleted",
+            f"Backup #{backup_id} reference deleted",
+        )
+
+    return redirect_with_notice(
+        f"/projects/{project_id}/settings",
+        f"Backup #{backup_id} removed.",
+        {"env": env_name, "tab": "backups"},
+    )
+
+
+@app.get("/projects/{project_id}/backups/{backup_id}/export")
+def export_backup_reference(
+    request: Request,
+    project_id: int,
+    backup_id: int,
+):
+    user = current_user(request)
+    if not user:
+        return RedirectResponse("/login")
+
+    with db_session() as db:
+        project = get_project_for_user(db, user, project_id)
+        if not project:
+            return HTMLResponse("Not found", status_code=404)
+        backup = db.query(BackupSnapshot).filter(BackupSnapshot.id == backup_id).first()
+        if not backup or backup.project_id != project.id:
+            return redirect_with_error(
+                f"/projects/{project_id}/settings",
+                "Backup not found.",
+            )
+        env_name = (backup.env or "dev").strip().lower()
+        if not (backup.object_path or "").strip():
+            return redirect_with_error(
+                f"/projects/{project_id}/settings",
+                "Backup object path is missing.",
+                {"env": env_name, "tab": "backups"},
+            )
+        try:
+            uri = s3_uri_for_object_path(backup.object_path or "")
+        except Exception as exc:
+            return redirect_with_error(
+                f"/projects/{project_id}/settings",
+                f"Export failed: {str(exc)[:180]}",
+                {"env": env_name, "tab": "backups"},
+            )
+
+    return redirect_with_notice(
+        f"/projects/{project_id}/settings",
+        f"Backup export path: {uri}",
+        {"env": env_name, "tab": "backups"},
     )
 
 

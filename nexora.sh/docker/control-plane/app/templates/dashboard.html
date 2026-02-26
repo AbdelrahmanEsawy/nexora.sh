@@ -122,7 +122,7 @@
         {% endif %}
       </div>
       <div class="row">
-        <a class="btn {% if project.status == 'deleting' %}disabled{% endif %}" href="/projects/{{ project.id }}/settings">Settings</a>
+        <a class="btn {% if project.status == 'deleting' %}disabled{% endif %}" href="/projects/{{ project.id }}/settings">Open</a>
         <form method="post" action="/projects/{{ project.id }}/delete" data-confirm="Delete project {{ project.display_name or project.slug }}?">
           <button class="btn ghost danger {% if project.status == 'deleting' %}disabled{% endif %}" type="submit" {% if project.status == "deleting" %}disabled{% endif %}>
             {{ "Deleting..." if project.status == "deleting" else "Delete" }}
